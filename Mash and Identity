@@ -1,0 +1,114 @@
+##################################### HJ ###########################
+####################################################################
+############# MASH ##################
+# Activate environment
+conda activate mash_env
+
+# Different tests in mash_env
+# -s , -p 
+# 1000
+mash sketch -o total_sketch -p 50 -s 1000 *.fna
+mash triangle -p 50 total_sketch.msh > hector_s1000.tsv
+
+# 3000
+mash sketch -o total_sketch3 -p 50 -s 3000 *.fna
+#mash triangle -p 50 total_sketch3.msh > hector_s3000.tsv
+
+# 5000
+mash sketch -o total_sketch5 -p 50 -s 5000 *.fna
+mash triangle -p 50 total_sketch5.msh > hector_s5000.tsv
+
+############ R #####################
+# Required packages
+library(dplyr)
+library(readr)
+library(stringr)
+
+# Load files
+###############################################
+s1000 <- read.csv("/xcxx/zzzzz/xxx/hector_s1000.tsv",
+                  sep = "\t", header = FALSE)
+
+# Count the number of 1's
+sum(s1000[,3] == 1)
+
+# Filter out rows where column 3 == 1
+hector_s1000_filtered <- s1000 %>% filter(s1000[,3] != 1)
+
+# Check again
+sum(hector_s1000_filtered[,3] == 1)
+head(hector_s1000_filtered)
+
+#############
+# Load s3000
+s3000 <- read.csv("/xxxxx/xxxx/xxxx/hector_s3000.tsv",
+                  sep = "\t", header = FALSE)
+
+sum(s3000[,3] == 1)
+
+hector_s3000_filtered <- s3000 %>% filter(s3000[,3] != 1)
+
+sum(hector_s3000_filtered[,3] == 1)
+head(hector_s3000_filtered)
+
+############
+# Load s5000
+s5000 <- read.csv("/x/xxxxxx/hector_s5000.tsv",
+                  sep = "\t", header = FALSE)
+
+sum(s5000[,3] == 1)
+
+hector_s5000_filtered <- s5000 %>% filter(s5000[,3] != 1)
+
+sum(hector_s5000_filtered[,3] == 1)
+head(hector_s5000_filtered)
+
+##############
+# Merge tables
+
+btotal_bacillus <- hector_s3000_filtered %>%
+  left_join(hector_s1000_filtered, by = c("V1", "V2")) %>%
+  left_join(hector_s2000_filtered, by = c("V1", "V2"))
+
+# Select core columns
+bacillus_total <- subset(btotal_bacillus, select = c("V1", "V2", "V3.x", "V3.y", "V3"))
+
+######################
+# Shorten genome names
+
+bacillus_total$V1 <- str_sub(bacillus_total$V1, 1, 15)
+bacillus_total$V2 <- str_sub(bacillus_total$V2, 1, 15)
+
+#######################################################
+# Create column with row means (ignores NA by default)
+
+hector_bacillus_prova <- bacillus_total %>% mutate(Mean = rowMeans(select(., V3.x, V3.y, V3), na.rm = TRUE), .after = V3)
+
+#######################################
+# Check and handle NA values (optional)
+
+anyNA(bacillus_total)
+sum(is.na(bacillus_total))
+
+# Replace NA with 0
+hector_bacillus_prova[is.na(hector_bacillus_prova)] <- 0 sum(is.na(hector_bacillus_prova))
+
+#######################################
+# Sequence identity (1 - mean)
+
+hector_bacillus_prova$Identity <- 1 - hector_bacillus_prova$Mean
+
+##########################
+# Select columns for output
+
+bacillus_prova_id <- subset(hector_bacillus_prova, select = c("V1", "V2", "Identity"))
+#################
+# Filter, 0.90, 0.95, etc....
+bacillus_prova_id <- bacillus_prova_id %>% filter(Identity > 0.95)
+
+#############
+# Save to CSV
+write.csv(bacillus_prova_id, file = "/xxxx/xxx/xxx/bacillus_prova_id.csv", row.names = FALSE)
+
+# Reload (optional)
+bacillus_prova_id <- read.csv("/xxxx/xxxxx/xxxx/bacillus_prova_id.csv", header = TRUE)
