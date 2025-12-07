@@ -1,0 +1,379 @@
+################## HJ ###############
+#####    Use of LPA, modified
+
+#!/usr/bin/env python3
+
+import pandas as pd
+import networkx as nx
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.cm import get_cmap
+from matplotlib.colors import Normalize
+from collections import Counter, defaultdict
+import random
+from scipy.cluster import hierarchy
+from scipy.spatial.distance import pdist, squareform
+
+# ==========================
+# Reproducibility configuration
+# ==========================
+SEED = 1998
+np.random.seed(SEED)
+random.seed(SEED)
+plt.style.use('ggplot')
+
+# ==========================
+# 1. Data loading functions
+# ==========================
+def load_data():
+    edges_data = pd.read_csv(
+        "/xxx/xxx/xx/xxx/bacillus_mash_95.csv",
+        sep=',',
+        dtype={"V1": str, "V2": str, "Identidade": float}
+    )
+    
+    genomes_ref = pd.read_excel(
+        "/xxx/xxxx/xxx/xxxx/genomas_GTDB_B.ods", 
+        engine="odf",
+        dtype={"ID": str}
+    ).rename(columns={'Name': 'Species'})
+    
+    return edges_data, genomes_ref
+
+# ==========================
+# 2. Graph construction and improved LPA
+# ==========================
+def build_graph(edges_data):
+    G = nx.Graph()
+    for _, row in edges_data.iterrows():
+        G.add_edge(row["V1"], row["V2"], weight=row["Identidade"])
+    return G
+
+def apply_LPA(G):
+    """Improved Label Propagation Algorithm with integrity checks"""
+    print("Applying improved LPA...")
+
+    # Identify isolated nodes (degree 0)
+    isolated_nodes = [n for n in G.nodes if G.degree(n) == 0]
+    
+    # Create bidirectional mapping for stable ordering
+    nodes_sorted = sorted(G.nodes(), key=lambda x: G.degree(x))
+    mapping = {n: i for i, n in enumerate(nodes_sorted)}
+    reverse_mapping = {v: k for k, v in mapping.items()}
+    
+    # Create a relabeled copy of the graph with integer nodes
+    G_sorted = nx.relabel_nodes(G, mapping, copy=True)
+    
+    def weighted_label_propagation(G_local, max_iter=2500, stability_threshold=0.003):
+        # Verified initialization
+        labels = {n: -1 if n in isolated_nodes else i for i, n in enumerate(G_local.nodes())}
+        
+        for _ in range(max_iter):
+            changed = False
+            nodes = list(G_local.nodes())
+            
+            for node in nodes:
+                if node in isolated_nodes:
+                    continue
+                
+                neighbor_weights = defaultdict(float)
+                total_weight = 0.0
+                
+                for neighbor in G_local.neighbors(node):
+                    edge_weight = G_local[node][neighbor].get('weight', 1.0)
+                    neighbor_label = labels[neighbor]
+                    neighbor_weights[neighbor_label] += edge_weight
+                    total_weight += edge_weight
+                
+                if not neighbor_weights:
+                    continue
+                
+                current_label = labels[node]
+                current_strength = neighbor_weights.get(current_label, 0) / total_weight if total_weight > 0 else 0
+                
+                max_weight = max(neighbor_weights.values())
+                candidates = [label for label, w in neighbor_weights.items() 
+                              if w >= max_weight * (1 - stability_threshold)]
+                
+                if current_label not in candidates:
+                    new_label = random.choice(candidates)
+                    new_strength = neighbor_weights[new_label] / total_weight
+                    
+                    if (new_strength - current_strength) > stability_threshold:
+                        labels[node] = new_label
+                        changed = True
+            
+            if not changed:
+                break
+        
+        # Merge small communities
+        comm_sizes = Counter(labels.values())
+        min_size = max(5, int(0.005 * len(G_local)))
+        small_comms = [comm for comm, size in comm_sizes.items() if size < min_size and comm != -1]
+        
+        for comm in small_comms:
+            for node in [n for n, l in labels.items() if l == comm]:
+                neighbors = list(G_local.neighbors(node))
+                if neighbors:
+                    new_label = Counter([labels[n] for n in neighbors]).most_common(1)[0][0]
+                    labels[node] = new_label
+        
+        # Handle isolated nodes: assign them to a new separate community id
+        if isolated_nodes:
+            main_comm = max(labels.values()) + 1
+            for node in isolated_nodes:
+                labels[node] = main_comm
+        
+        # Critical verification
+        assert len(labels) == len(G_local.nodes()), "Error: missing nodes in labels"
+        return labels
+    
+    labels = weighted_label_propagation(G_sorted)
+    
+    # Reverse mapping back to original node names and verify
+    node_to_comm = {}
+    for sorted_node, comm_id in labels.items():
+        original_node = reverse_mapping[sorted_node]
+        node_to_comm[original_node] = comm_id
+    
+    assert set(node_to_comm.keys()) == set(G.nodes()), "Error in reverse mapping"
+    return node_to_comm
+
+# ==========================
+# 3. Improved taxonomic labeling
+# ==========================
+def assign_taxonomic_labels(comm_to_nodes, genomes_ref, G):
+    ref_species = genomes_ref.set_index('ID')['Species'].to_dict()
+    labels = {}
+    ref_ids = set(ref_species.keys())
+    isolated_comm = None
+    
+    # Identify community of isolated nodes
+    for com_id, nodes in comm_to_nodes.items():
+        if all(G.degree(n) == 0 for n in nodes):
+            isolated_comm = com_id
+            labels[com_id] = "Bacillus spp. (Isolates)"
+            break
+    
+    # Handle communities without references
+    communities_no_ref = []
+    for com_id, nodes in comm_to_nodes.items():
+        if com_id == isolated_comm:
+            continue
+        
+        if not any(n in ref_ids for n in nodes):
+            communities_no_ref.append((com_id, len(nodes)))
+    
+    communities_no_ref.sort(key=lambda x: -x[1])
+    for i, (com_id, _) in enumerate(communities_no_ref, 1):
+        labels[com_id] = f"Bacillus spp{i}"
+    
+    # Handle communities with references
+    for com_id, nodes in comm_to_nodes.items():
+        if com_id in labels:
+            continue
+        
+        species_list = [ref_species[n] for n in nodes if n in ref_ids]
+        counter = Counter(species_list)
+        total_ref = len(species_list)
+        
+        if total_ref > 0:
+            top_species, count = counter.most_common(1)[0]
+            if count / total_ref >= 0.7:
+                labels[com_id] = top_species
+            else:
+                labels[com_id] = f"Hybrid: {', '.join(sorted(counter.keys()))}"
+        else:
+            # If no reference inside the community, pick the closest reference by edge weight
+            closest_ref = None
+            max_weight = -1
+            for node in nodes:
+                for neighbor in G.neighbors(node):
+                    if neighbor in ref_ids:
+                        weight = G[node][neighbor]['weight']
+                        if weight > max_weight:
+                            max_weight = weight
+                            closest_ref = ref_species[neighbor]
+            labels[com_id] = f"Unclassified ({closest_ref}-like)" if closest_ref else "Bacillus spp. (Novel)"
+    
+    return labels
+
+# ==========================
+# 4. Improved visualization
+# ==========================
+def plot_representative_communities(G, comm_to_nodes, community_labels, output_prefix):
+    """Representative communities graph with improved color scheme"""
+    plt.figure(figsize=(30, 25))
+    pos = nx.spring_layout(G, seed=SEED, k=0.3)
+    
+    # Color map and normalization (identity range)
+    cmap = plt.cm.YlOrRd
+    norm = Normalize(vmin=0.95, vmax=1.0)
+    
+    # Draw edges first colored by weight
+    for u, v, d in G.edges(data=True):
+        plt.plot([pos[u][0], pos[v][0]], [pos[u][1], pos[v][1]],
+                 color=cmap(norm(d['weight'])),
+                 alpha=0.6, linewidth=0.8)
+    
+    # Draw representative nodes for each community
+    for comm_id, nodes in comm_to_nodes.items():
+        subg = G.subgraph(nodes)
+        if len(subg) > 0:
+            try:
+                center = max(nx.closeness_centrality(subg).items(), key=lambda x: x[1])[0]
+            except Exception:
+                center = list(subg.nodes())[0]
+            
+            # Color based on average intra-community weight
+            edge_weights = [d['weight'] for u, v, d in subg.edges(data=True)]
+            color = cmap(norm(np.mean(edge_weights))) if edge_weights else cmap(norm(0.95))
+            
+            nx.draw_networkx_nodes(
+                G, pos,
+                nodelist=[center],
+                node_size=200,
+                node_color=[color],
+                edgecolors='black',
+                linewidths=1.5
+            )
+            
+            # Label text
+            plt.text(pos[center][0], pos[center][1] + 0.02,
+                     community_labels[comm_id],
+                     fontsize=9, ha='center', va='bottom',
+                     bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.2'))
+    
+    # Colorbar legend
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    plt.colorbar(sm, shrink=0.7).set_label('Genomic Identity')
+    
+    plt.title("Representative communities of the genus Bacillus", fontsize=18)
+    plt.axis('off')
+    plt.savefig(f"{output_prefix}_Representative_Communities_{SEED}.png", dpi=400, bbox_inches='tight')
+    plt.close()
+
+def plot_references_connections(G, genomes_ref, community_labels, node_to_comm, output_prefix):
+    """Graph highlighting reference genomes and their connections"""
+    plt.figure(figsize=(30, 25))
+    pos = nx.spring_layout(G, seed=SEED, k=0.3)
+    
+    cmap = plt.cm.YlOrRd
+    norm = Normalize(vmin=0.95, vmax=1.0)
+    ref_ids = set(genomes_ref['ID'])
+    
+    # Draw edges
+    for u, v, d in G.edges(data=True):
+        plt.plot([pos[u][0], pos[v][0]], [pos[u][1], pos[v][1]],
+                 color=cmap(norm(d['weight'])),
+                 alpha=0.4, linewidth=0.6)
+    
+    # Non-reference nodes colored by mean connected weight
+    non_ref_nodes = [n for n in G.nodes if n not in ref_ids]
+    node_colors = []
+    for n in non_ref_nodes:
+        weights = [d['weight'] for _, _, d in G.edges(n, data=True)]
+        node_colors.append(cmap(norm(np.mean(weights))) if weights else cmap(norm(0.95)))
+    
+    nx.draw_networkx_nodes(
+        G, pos,
+        nodelist=non_ref_nodes,
+        node_size=50,
+        node_color=node_colors,
+        edgecolors='black',
+        linewidths=0.5
+    )
+    
+    # Reference nodes
+    ref_nodes = [n for n in G.nodes if n in ref_ids]
+    nx.draw_networkx_nodes(
+        G, pos,
+        nodelist=ref_nodes,
+        node_size=150,
+        node_color='yellow',
+        edgecolors='red',
+        linewidths=1.5
+    )
+    
+    # Labels for reference nodes
+    for node in ref_nodes:
+        plt.text(pos[node][0], pos[node][1] + 0.02,
+                 community_labels[node_to_comm[node]],
+                 fontsize=8, ha='center', va='bottom',
+                 color='darkred',
+                 bbox=dict(facecolor='white', alpha=0.8, boxstyle='round,pad=0.1'))
+    
+    # Colorbar
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    plt.colorbar(sm, shrink=0.7).set_label('Genomic Identity')
+    
+    plt.title("Reference genome links", fontsize=18)
+    plt.axis('off')
+    plt.savefig(f"{output_prefix}_Reference_Links_{SEED}.png", dpi=400, bbox_inches='tight')
+    plt.close()
+
+# ==========================
+# 5. Export full results
+# ==========================
+def export_full_results(G, comm_to_nodes, community_labels, genomes_ref):
+    # Build node -> community mapping
+    node_to_comm = {node: comm_id for comm_id, nodes in comm_to_nodes.items() for node in nodes}
+    
+    # Node-level data
+    node_data = pd.DataFrame({
+        'ID': list(G.nodes()),
+        'Community': [node_to_comm[node] for node in G.nodes()],
+        'Degree': [G.degree(node) for node in G.nodes()],
+        'Is_Isolate': [community_labels[node_to_comm[node]] == "Bacillus spp. (Isolates)" for node in G.nodes()],
+        'Taxonomic_Label': [community_labels[node_to_comm[node]] for node in G.nodes()]
+    }).merge(genomes_ref[['ID', 'Species']], on='ID', how='left')
+    
+    # Community-level summary
+    community_data = []
+    for comm_id, nodes in comm_to_nodes.items():
+        subg = G.subgraph(nodes)
+        intra_weights = [d['weight'] for u, v, d in subg.edges(data=True)]
+        
+        community_data.append({
+            'Community_ID': comm_id,
+            'Label': community_labels[comm_id],
+            'Size': len(nodes),
+            'Density': nx.density(subg),
+            'Mean_Identity': np.mean(intra_weights) if intra_weights else 0,
+            'Contains_Reference': any(n in genomes_ref['ID'].values for n in nodes),
+            'Is_Hybrid': "Hybrid" in community_labels[comm_id]
+        })
+    
+    # Export to Excel
+    with pd.ExcelWriter(f"Full_Results_{SEED}.xlsx") as writer:
+        pd.DataFrame(node_data).to_excel(writer, sheet_name='Nodes', index=False)
+        pd.DataFrame(community_data).to_excel(writer, sheet_name='Communities', index=False)
+
+# ==========================
+# 6. Main execution
+# ==========================
+if __name__ == "__main__":
+    print(f"Starting analysis with seed {SEED}")
+    
+    edges_data, genomes_ref = load_data()
+    G = build_graph(edges_data)
+    
+    node_to_comm = apply_LPA(G)
+    comm_to_nodes = defaultdict(list)
+    for node, comm_id in node_to_comm.items():
+        comm_to_nodes[comm_id].append(node)
+    
+    community_labels = assign_taxonomic_labels(comm_to_nodes, genomes_ref, G)
+    
+    plot_representative_communities(G, comm_to_nodes, community_labels, f"Figure_{SEED}")
+    plot_references_connections(G, genomes_ref, community_labels, node_to_comm, f"Figure_{SEED}")
+    
+    export_full_results(G, comm_to_nodes, community_labels, genomes_ref)
+    
+    print(f"Analysis completed!\nResults saved in: Full_Results_{SEED}.xlsx")
+
+
+
+
