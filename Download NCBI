@@ -1,0 +1,91 @@
+######################## HJ ########################
+
+# Activate environment
+# conda activate ncbi_data
+
+### Download from NCBI, with initial list of genomes
+
+#!/bin/bash
+
+# File containing the list of genome accessions
+accession_file="/xxxx/xxxxx/xxxxx/xxxxxx/bacillus_GCF.txt"
+
+# Directory to store downloads
+download_dir="genome_downloads"
+mkdir -p "$download_dir"
+
+# Maximum number of retries per download
+MAX_RETRY=5
+
+# Log file for failed downloads
+LOG="download_errors.log"
+> "$LOG"   # clear previous log
+
+echo "=== Starting robust genome downloads ==="
+
+# Function to verify ZIP integrity
+check_zip() {
+    unzip -t "$1" >/dev/null 2>&1
+    return $?
+}
+
+# Iterate through accession list
+while IFS= read -r acc || [[ -n "$acc" ]]; do
+    zip_file="$download_dir/$acc.zip"
+
+    echo "-----------------------------------------"
+    echo "Processing: $acc"
+
+    # If the ZIP already exists, verify integrity
+    if [[ -f "$zip_file" ]]; then
+        if check_zip "$zip_file"; then
+            echo "[OK] Valid file already exists: $zip_file — skipping download."
+            continue
+        else
+            echo "[!] Existing file is corrupted. Re-downloading..."
+            rm -f "$zip_file"
+        fi
+    fi
+
+    # Retry download loop
+    attempt=1
+    while [[ $attempt -le $MAX_RETRY ]]; do
+        echo "Attempt $attempt of $MAX_RETRY..."
+
+        datasets download genome accession "$acc" --filename "$zip_file"
+
+        # Check if download command succeeded
+        if [[ $? -eq 0 ]]; then
+            # Validate ZIP integrity
+            if check_zip "$zip_file"; then
+                echo "[OK] Successfully downloaded: $zip_file"
+                break
+            else
+                echo "[!] Corrupted ZIP file. Retrying..."
+                rm -f "$zip_file"
+            fi
+        else
+            echo "[!] Download failed. Retrying..."
+        fi
+
+        attempt=$((attempt+1))
+        sleep 3
+    done
+
+    # If failed after all attempts
+    if [[ $attempt -gt $MAX_RETRY ]]; then
+        echo "[ERROR] Could not download $acc after $MAX_RETRY attempts."
+        echo "$acc" >> "$LOG"
+    fi
+
+done < "$accession_file"
+
+echo "========================================="
+echo "Download process finished."
+echo "Files saved in: $download_dir"
+
+if [[ -s "$LOG" ]]; then
+    echo "Some accessions failed. Check: $LOG"
+else
+    echo "Downloads completed."
+fi
