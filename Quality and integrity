@@ -1,0 +1,355 @@
+###################### HJ ##########################
+############ Activate environment checkm v1 ########
+conda activate checkm_env
+
+# Used within the folder where all .fna files are located
+
+checkm lineage_wf -t 80 -x fna ./checkm_bacillus ./checkm
+
+# Processed data
+checkm qa ./checkm/lineage.ms ./checkm -o 2 > checkm_quality_assessment.txt
+cat checkm_quality_assessment.txt
+
+# Data in R
+library(dplyr)
+library(stringr)
+library(readr)
+
+# Read CheckM file
+bacillus_checkm <- read_lines(‘/xxxx/xxxxx/xxxx/checkm_quality_assessment.txt’)
+
+# Filter lines with GCF and separate by multiple spaces
+bacillus_checkm2 <- bacillus_checkm %>%
+  str_subset(‘^\\s*GCF’) %>%
+  str_split_fixed(‘\\s{2,}’, 15) %>%
+  as.data.frame(stringsAsFactors = FALSE)
+
+# Remove first empty column
+bacillus_data <- bacillus_checkm2[, -1]
+
+# Rename columns according to CheckM format
+bacillus_data <- bacillus_data %>% rename(`Bin Id` = V2,  `Marker lineage` = V3, Genomes = V4, Markers = V5, `Marker sets` = V6, `0` = V7, 
+  `1` = V8, `2` = V9, `3` = V10, `4` = V11, `5+` = V12, Completeness = V13, Contamination = V14, `Strain heterogeneity` = V15)
+
+# Save final CSV
+write.csv(bacillus_data, file = "/xxxxxx/xxxxx/checkm/bacillus_data.csv", row.names = FALSE)
+##########################################################################################################################################
+######################################################
+#############  BUSCO  ################################
+# Activate environment 
+conda activate busco_env
+
+# View current database list
+busco --list-datasets
+
+# Download database
+Exemplo> 
+busco --download bacteria_odb10
+###################################
+# Script for running multiple .fna
+#!/bin/bash
+LINEAGE="/XXXXX/lineages/XXXX"
+OUTDIR="../3_search_results"
+CPU=36
+
+mkdir -p ‘$OUTDIR’
+
+for genome in *.fna; do
+    base=$(basename ‘$genome’ .fna)
+    echo ‘>>> Processing: $genome’
+
+    LOGFILE="${OUTDIR}/${base}_search.log"
+
+    search \
+        -i ‘$genome’ \
+        -l ‘$LINEAGE’ \
+        -o ‘${base}_search’ \
+        -m genome \
+        --cpu $CPU \
+        --offline \
+        --out_path ‘$OUTDIR’ \
+        &> ‘$LOGFILE’
+
+    if [[ $? -eq 0 ]]; then
+        echo ‘✓ SEARCH completed successfully for: $genome’
+    else
+        echo ‘✗ ERROR in $genome — check the log: $LOGFILE’
+    fi
+done
+
+echo ‘>>> GENOMES COMPLETED’
+
+##################################################
+######### Script for reading txt files for BUSCO
+### BASH: Reading multiple .txt files from BUSCO
+
+#!/bin/bash
+# Create a summary file with headers
+echo "Genome Total_BUSCOs Single_copy Duplicated Fragmented Missing" > busco_summary.txt
+
+# Iterate over each BUSCO output directory
+for dir in /xxx/xxxxx/4_busco/output_busco/*; do
+    if [ -d "$dir" ]; then
+        
+        # Find the summary file using the expected BUSCO pattern
+        summary_file=$(find "$dir" -name 'short_summary.specific.bacillales_odb10.*.txt')
+
+        if [ -f "$summary_file" ]; then
+            
+            # Extract genome name
+            genome=$(basename "$summary_file" | sed 's/short_summary.specific.bacillales_odb10.//; s/_busco.txt//')
+
+            # Extract BUSCO metrics
+            complete_BUSCOs=$(grep "Complete BUSCOs" "$summary_file" | awk '{print $1}')
+            complete_single=$(grep "Complete and single-copy BUSCOs" "$summary_file" | awk '{print $1}')
+            complete_duplicated=$(grep "Complete and duplicated BUSCOs" "$summary_file" | awk '{print $1}')
+            fragmented=$(grep "Fragmented BUSCOs" "$summary_file" | awk '{print $1}')
+            missing=$(grep "Missing BUSCOs" "$summary_file" | awk '{print $1}')
+            total_orthologs=$(grep "Total BUSCO groups searched" "$summary_file" | awk '{print $1}')
+
+            # Write results to the summary file
+            echo "$genome $total_orthologs $complete_single $complete_duplicated $fragmented $missing" >> busco_summary.txt
+        fi
+    fi
+done
+
+####################
+##### Python:  Reading multiple .txt files from BUSCO (V6.0.0)
+
+#!/usr/bin/env python3
+import os
+import re
+import csv
+from pathlib import Path
+
+def parse_busco_file(file_path):
+    """
+    Robust extraction of BUSCO summary files.
+    Correctly handles assembly statistics.
+    """
+    data = {}
+    
+    try:
+        with open(file_path, 'r') as f:
+            content = f.read()
+    except Exception as e:
+        print(f"  Error reading {file_path}: {e}")
+        return None
+    
+    # 1. Extract BUSCO percentages
+    pattern = r'C:([\d\.]+)%\[S:([\d\.]+)%,D:([\d\.]+)%\],F:([\d\.]+)%,M:([\d\.]+)%,n:(\d+)'
+    match = re.search(pattern, content)
+    
+    if not match:
+        # Try alternate pattern (rare cases)
+        pattern2 = r'C:([\d\.]+)%\[S:([\d\.]+)%,D:([\d\.]+)%\],F:([\d\.]+)%,M:([\d\.]+)%,n:(\d+)'
+        match = re.search(pattern2, content)
+    
+    if match:
+        try:
+            data['Complete'] = float(match.group(1))
+            data['Complete_and_single_copy'] = float(match.group(2))
+            data['Complete_and_duplicated'] = float(match.group(3))
+            data['Fragmented'] = float(match.group(4))
+            data['Missing'] = float(match.group(5))
+            data['Total'] = int(match.group(6))
+        except ValueError as e:
+            print(f"  Error converting values in {file_path}: {e}")
+            return None
+    else:
+        print(f"  BUSCO percentages not found in {file_path}")
+        return None
+    
+    # 2. Extract assembly statistics
+    lines = content.split('\n')
+    in_assembly_section = False
+    
+    for i, line in enumerate(lines):
+        line = line.strip()
+        
+        if "Assembly Statistics:" in line:
+            in_assembly_section = True
+            continue
+        
+        if in_assembly_section and ("Dependencies and versions:" in line or "hmmsearch:" in line):
+            break
+        
+        if in_assembly_section and line:
+            parts = re.split(r'\t+', line)
+            if len(parts) < 2:
+                parts = re.split(r'\s{2,}', line)
+            
+            if len(parts) >= 2:
+                value = parts[0].strip()
+                label = parts[1].strip()
+                
+                if label == "Number of scaffolds":
+                    try:
+                        data['Number_of_scaffolds'] = int(value.replace(',', ''))
+                    except:
+                        data['Number_of_scaffolds'] = value
+                
+                elif label == "Number of contigs":
+                    try:
+                        data['Number_of_contigs'] = int(value.replace(',', ''))
+                    except:
+                        data['Number_of_contigs'] = value
+                
+                elif label == "Total length":
+                    try:
+                        data['Total_length'] = int(value.replace(',', ''))
+                    except:
+                        data['Total_length'] = value
+                
+                elif label == "Percent gaps":
+                    try:
+                        data['Percent_gaps'] = float(value.replace('%', ''))
+                    except:
+                        data['Percent_gaps'] = 0.0
+                
+                elif label == "Scaffold N50":
+                    data['Scaffold_N50'] = value
+                
+                elif label == "Contigs N50":
+                    data['Contigs_N50'] = value
+    
+    required_fields = [
+        'Number_of_scaffolds', 'Number_of_contigs', 'Total_length',
+        'Percent_gaps', 'Scaffold_N50', 'Contigs_N50'
+    ]
+    
+    for field in required_fields:
+        if field not in data:
+            data[field] = 'N/A'
+    
+    return data
+
+def main():
+    """
+    Main function
+    """
+    BASE_DIR = Path("/xxx/xxxx/xxxx/3_busco_results")
+    OUTPUT_DIR = Path("/xxxx/xxxx/xxxx/0_inicio")
+    OUTPUT_FILE = OUTPUT_DIR / "busco_results_corrected.csv"
+    
+    print("=" * 70)
+    print("BUSCO RESULTS PROCESSOR - FIXED VERSION")
+    print("=" * 70)
+    
+    if not BASE_DIR.exists():
+        print(f"ERROR: Directory does not exist: {BASE_DIR}")
+        return
+    
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    all_folders = [f for f in BASE_DIR.iterdir() if f.is_dir()]
+    total_folders = len(all_folders)
+    
+    print(f"Found {total_folders} folders in {BASE_DIR}")
+    print("Processing...")
+    print("-" * 70)
+    
+    all_data = []
+    processed = 0
+    errors = 0
+    
+    for i, folder in enumerate(all_folders):
+        folder_name = folder.name
+        
+        genome_id = folder_name[:15] if len(folder_name) >= 15 else folder_name
+        
+        txt_files = list(folder.glob("short_summary*.txt"))
+        
+        if not txt_files:
+            txt_files = list(folder.glob("*busco*.txt"))
+        
+        if not txt_files:
+            print(f"  [{i+1}/{total_folders}] ✗ No .txt file found in: {folder_name}")
+            errors += 1
+            continue
+        
+        txt_file = txt_files[0]
+        
+        data = parse_busco_file(txt_file)
+        
+        if not data:
+            print(f"  [{i+1}/{total_folders}] ✗ Error parsing: {folder_name}")
+            errors += 1
+            continue
+        
+        row = {
+            'Genome_ID': genome_id,
+            'Source_Folder': folder_name,
+            'Complete': data.get('Complete', 'N/A'),
+            'Complete_and_single_copy': data.get('Complete_and_single_copy', 'N/A'),
+            'Complete_and_duplicated': data.get('Complete_and_duplicated', 'N/A'),
+            'Fragmented': data.get('Fragmented', 'N/A'),
+            'Missing': data.get('Missing', 'N/A'),
+            'Total': data.get('Total', 'N/A'),
+            'Number_of_scaffolds': data.get('Number_of_scaffolds', 'N/A'),
+            'Number_of_contigs': data.get('Number_of_contigs', 'N/A'),
+            'Total_length': data.get('Total_length', 'N/A'),
+            'Percent_gaps': data.get('Percent_gaps', 'N/A'),
+            'Scaffold_N50': data.get('Scaffold_N50', 'N/A'),
+            'Contigs_N50': data.get('Contigs_N50', 'N/A')
+        }
+        
+        all_data.append(row)
+        processed += 1
+        
+        if (i + 1) % 100 == 0:
+            print(f"  [{i+1}/{total_folders}] Processed: {processed}, Errors: {errors}")
+    
+    if all_data:
+        fieldnames = [
+            'Genome_ID', 'Source_Folder', 'Complete', 'Complete_and_single_copy',
+            'Complete_and_duplicated', 'Fragmented', 'Missing', 'Total',
+            'Number_of_scaffolds', 'Number_of_contigs', 'Total_length',
+            'Percent_gaps', 'Scaffold_N50', 'Contigs_N50'
+        ]
+        
+        with open(OUTPUT_FILE, 'w', newline='') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(all_data)
+        
+        print("-" * 70)
+        print(f"PROCESS COMPLETED")
+        print(f"Total folders: {total_folders}")
+        print(f"Successfully processed: {processed}")
+        print(f"With errors: {errors}")
+        print(f"Success rate: {(processed/total_folders*100):.1f}%")
+        print(f"\nCSV file saved at: {OUTPUT_FILE}")
+        
+        print("\n--- EXAMPLE OF EXTRACTED DATA ---")
+        print("(First 3 rows)")
+        print("-" * 70)
+        
+        with open(OUTPUT_FILE, 'r') as f:
+            reader = csv.DictReader(f)
+            for j, row in enumerate(reader):
+                if j < 3:
+                    print(f"Row {j+1}:")
+                    print(f"  Genome_ID: {row['Genome_ID']}")
+                    print(f"  Complete: {row['Complete']}%")
+                    print(f"  Scaffolds: {row['Number_of_scaffolds']}")
+                    print(f"  Contigs: {row['Number_of_contigs']}")
+                    print(f"  Total length: {row['Total_length']}")
+                    print(f"  Scaffold N50: {row['Scaffold_N50']}")
+                    print()
+    else:
+        print("✗ ERROR: No data extracted.")
+    
+    print("=" * 70)
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
