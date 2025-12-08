@@ -1,5 +1,6 @@
 ################## HJ ###############
-#####    Use of LPA, modified
+#####################################
+##### LPA, for use with Mash
 
 #!/usr/bin/env python3
 
@@ -375,5 +376,715 @@ if __name__ == "__main__":
     print(f"Analysis completed!\nResults saved in: Full_Results_{SEED}.xlsx")
 
 
+###########################################################################################################
+###########################################################################################################
+######################## FastANI ##########################
 
+# Activate environment
+conda activate fastani_env
 
+# A list of genome IDs is used when there are several genomes to work with
+fastANI --q1 xxxx.txt --rl xxxx.txt --output fastani_results.txt --threads 80
+
+# LPA, for use with fastANI
+
+#!/usr/bin/env python3
+
+import os
+import pandas as pd
+import numpy as np
+import networkx as nx
+import random
+import matplotlib.pyplot as plt
+import seaborn as sns
+from collections import defaultdict
+import logging
+from scipy.cluster import hierarchy
+from scipy.spatial.distance import pdist
+import time
+import textwrap
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
+
+# =============================
+# CONFIGURATION
+# =============================
+# Seed for reproducibility
+SEED = 1998
+np.random.seed(SEED)
+random.seed(SEED)
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger()
+
+# Directory with FastANI results
+FASTANI_DIR = "/xxxxxx/xxxxx/xxxx/xxxxx/complexo_xxx"
+
+# FastANI results file
+FASTANI_RESULTS = os.path.join(FASTANI_DIR, "fastani_results_matrix.txt")
+
+# GTDB reference file
+GTDB_REF_FILE = "/xxxx/xxxx/xxxx/xxxxx/Species_GTDB.ods"
+
+# ANI threshold for species (Threshold to be defined, done manually)
+ANI_SPECIES_THRESHOLD = 0.971 
+
+# ===============
+# DATA - FastANI
+# ===============
+def load_gtdb_references(gtdb_path):
+    """Loads GTDB references preserving original names and generates short IDs"""
+    # Read ODS file directly
+    try:
+        df = pd.read_excel(gtdb_path, engine='odf')  # Use engine='odf' for .ods
+        logger.info(f"Columns in reference file: {df.columns.tolist()}")
+    except Exception as e:
+        logger.error(f"Error reading reference file: {str(e)}")
+        raise
+    
+    # Specific columns for this file
+    id_col = 'ID'
+    species_col = 'Species'
+    
+    # Verify columns exist
+    if id_col not in df.columns:
+        raise KeyError(f"Column '{id_col}' not found in reference file")
+    if species_col not in df.columns:
+        raise KeyError(f"Column '{species_col}' not found in reference file")
+    
+    # Create dictionaries
+    ref_dict = {}       # ID -> species name
+    short_ref_dict = {} # Short ID (15 chars) -> species name
+    
+    for _, row in df.iterrows():
+        genome_id = str(row[id_col]).strip()
+        species_name = str(row[species_col]).strip()
+        
+        # Short ID (first 15 characters)
+        short_id = genome_id[:15]
+        
+        # Add to main dictionary
+        ref_dict[genome_id] = species_name
+        short_ref_dict[short_id] = species_name
+        
+        # Also consider versions without dots (sometimes FastANI modifies)
+        alt_id = genome_id.replace(".", "_")
+        if alt_id != genome_id:
+            ref_dict[alt_id] = species_name
+            short_ref_dict[alt_id[:15]] = species_name
+    
+    logger.info(f"Loaded {len(ref_dict)} GTDB references")
+    logger.info(f"Generated {len(short_ref_dict)} short reference IDs")
+    
+    return ref_dict, short_ref_dict
+
+def load_matrix_format(fastani_path):
+    """Loads condensed matrix format from FastANI"""
+    logger.info("Loading condensed matrix format from FastANI...")
+    with open(fastani_path, 'r') as f:
+        n = int(f.readline().strip())
+        genomes = [f.readline().strip() for _ in range(n)]
+        
+        # Read lower triangular matrix
+        matrix_data = []
+        for i in range(n):
+            parts = f.readline().split('\t')
+            # Ignore first column (genome name) and take i numeric values
+            values = []
+            for j in range(1, i+2):  # i+1 numeric values in the line
+                try:
+                    val = float(parts[j])
+                except:
+                    val = np.nan
+                values.append(val)
+            matrix_data.append(values)
+    
+    # Build complete square matrix
+    full_matrix = np.zeros((n, n))
+    np.fill_diagonal(full_matrix, 1.0)  # Diagonal
+    
+    # Fill lower triangular part
+    for i in range(1, n):
+        for j in range(i):
+            full_matrix[i, j] = matrix_data[i][j]
+    
+    # Make symmetric (copy lower triangle to upper)
+    full_matrix = np.maximum(full_matrix, full_matrix.T)
+    
+    # Convert to DataFrame
+    ani_df = pd.DataFrame(full_matrix, index=genomes, columns=genomes)
+    
+    # Normalize if necessary
+    if ani_df.max().max() > 1.0:
+        logger.info("Normalizing ANI values (dividing by 100)")
+        ani_df = ani_df / 100.0
+    
+    logger.info(f"ANI matrix loaded: {ani_df.shape[0]} genomes")
+    return ani_df
+
+def load_tabular_format(fastani_path):
+    """Loads standard tabular format from FastANI"""
+    logger.info("Loading tabular format from FastANI...")
+    try:
+        df = pd.read_csv(
+            fastani_path, 
+            sep='\t', 
+            header=None,
+            names=['query', 'reference', 'ani', 'fragments_mapped', 'total_fragments']
+        )
+    except Exception as e:
+        logger.error(f"Error reading FastANI file: {str(e)}")
+        raise
+    
+    # Normalize ANI to fraction if necessary
+    if df['ani'].max() > 1.0:
+        logger.info("Normalizing ANI values to fraction (dividing by 100)")
+        df['ani'] = df['ani'] / 100.0
+    
+    # Get unique list of genomes
+    genomes = sorted(set(df['query']).union(set(df['reference'])))
+    logger.info(f"Unique genomes found: {len(genomes)}")
+    
+    # Create empty matrix with diagonal=1.0 and other values NaN
+    ani_matrix = pd.DataFrame(
+        np.identity(len(genomes)) * 1.0,
+        index=genomes,
+        columns=genomes
+    )
+    
+    # Initialize with NaN in non-diagonals
+    for i in range(len(genomes)):
+        for j in range(len(genomes)):
+            if i != j:
+                ani_matrix.iloc[i, j] = np.nan
+    
+    # Fill matrix with ANI values
+    logger.info("Building similarity matrix...")
+    for _, row in df.iterrows():
+        query = row['query']
+        ref = row['reference']
+        ani_val = row['ani']
+        
+        # Assign symmetric values
+        ani_matrix.at[query, ref] = ani_val
+        ani_matrix.at[ref, query] = ani_val
+    
+    # Complete diagonal with 1.0
+    np.fill_diagonal(ani_matrix.values, 1.0)
+    
+    logger.info(f"✔ ANI matrix built: {ani_matrix.shape[0]}x{ani_matrix.shape[1]}")
+    logger.info(f"ANI range: min={ani_matrix.min().min():.4f}, max={ani_matrix.max().max():.4f}")
+    
+    return ani_matrix
+
+def load_fastani_results(fastani_path):
+    """Loads FastANI results and builds similarity matrix, auto-detecting format"""
+    logger.info(f"Loading FastANI results from: {fastani_path}")
+    
+    # Check format: if first line is a number, it's condensed matrix
+    try:
+        with open(fastani_path, 'r') as f:
+            first_line = f.readline().strip()
+            if first_line.isdigit():
+                logger.info("Format detected: Condensed matrix")
+                return load_matrix_format(fastani_path)
+            else:
+                logger.info("Format detected: Tabular")
+                # Return to start
+                f.seek(0)
+                return load_tabular_format(fastani_path)
+    except Exception as e:
+        logger.error(f"Error detecting format: {str(e)}")
+        raise
+
+# ========================
+# ALGORITHM FUNCTIONS
+# ========================
+def build_ani_graph(ani_matrix):
+    """
+    Builds graph based solely on ANI
+    - Nodes: genomes
+    - Edges: ANI ≥ threshold (95%)
+    - Weight: ANI value
+    """
+    logger.info("Building ANI similarity graph...")
+    G = nx.Graph()
+    genomes = ani_matrix.index.tolist()
+    
+    for genome in genomes:
+        G.add_node(genome)
+    
+    edges_added = 0
+    n = len(genomes)
+    
+    for i in range(n):
+        genome1 = genomes[i]
+        for j in range(i+1, n):
+            genome2 = genomes[j]
+            ani = ani_matrix.iloc[i, j]
+            
+            if pd.isna(ani):
+                continue
+                
+            if ani >= ANI_SPECIES_THRESHOLD:
+                G.add_edge(genome1, genome2, weight=ani)
+                edges_added += 1
+    
+    logger.info(f"Graph built: {len(genomes)} nodes, {edges_added} edges")
+    return G
+
+def label_propagation(graph, references):
+    """
+    Label propagation:
+    1. Reference nodes are fixed with their species name
+    2. Other nodes adopt the most frequent/weighted label from their neighbors
+    """
+    logger.info("Starting label propagation...")
+    
+    # Initialize nodes
+    fixed_nodes = 0
+    for node in graph.nodes:
+        if node in references:
+            graph.nodes[node]['label'] = references[node]
+            graph.nodes[node]['fixed'] = True
+            fixed_nodes += 1
+        else:
+            graph.nodes[node]['label'] = None
+            graph.nodes[node]['fixed'] = False
+    
+    logger.info(f"  - Fixed nodes (references): {fixed_nodes}/{len(graph.nodes)}")
+    
+    # Iterate until convergence
+    for iter_num in range(10):
+        nodes = list(graph.nodes)
+        random.shuffle(nodes)
+        changes = 0
+        
+        for node in nodes:
+            if graph.nodes[node]['fixed']:
+                continue
+                
+            neighbor_labels = defaultdict(float)
+            for neighbor in graph.neighbors(node):
+                label = graph.nodes[neighbor].get('label')
+                if label:
+                    weight = graph[node][neighbor].get('weight', 0)
+                    neighbor_labels[label] += weight
+                    
+            if neighbor_labels:
+                new_label = max(neighbor_labels, key=neighbor_labels.get)
+                if graph.nodes[node]['label'] != new_label:
+                    graph.nodes[node]['label'] = new_label
+                    changes += 1
+            else:
+                # If no neighbors, try to assign by closest reference
+                closest_ref = None
+                max_ani = 0.0
+                for ref in references:
+                    if graph.has_edge(node, ref):
+                        ani_val = graph[node][ref]['weight']
+                        if ani_val > max_ani:
+                            max_ani = ani_val
+                            closest_ref = ref
+                
+                if closest_ref:
+                    graph.nodes[node]['label'] = references[closest_ref]
+                    changes += 1
+                    logger.info(f"  Isolated node {node[:10]} assigned to {references[closest_ref]}")
+        
+        logger.info(f"  Iteration {iter_num+1}: {changes} changes")
+        if changes == 0:
+            logger.info("  Convergence reached")
+            break
+    
+    # Report results
+    assigned = sum(1 for node in graph.nodes if graph.nodes[node]['label'] is not None)
+    logger.info(f"  Assigned nodes: {assigned}/{len(graph.nodes)}")
+    
+    return graph
+
+def cluster_unassigned_nodes(graph, consensus_labels, references, short_ref_dict):
+    """
+    Handles unassigned nodes with improved naming logic:
+    1. Identifies unassigned connected components
+    2. For each component:
+       - If it contains a reference: uses that name
+       - If not: names as Bacillus sppX (where X is unique counter)
+    """
+    logger.info("Handling unassigned nodes with improved logic...")
+    unassigned = [node for node in graph.nodes if consensus_labels.get(node) is None]
+    
+    if not unassigned:
+        logger.info("No unassigned nodes")
+        return consensus_labels
+    
+    logger.info(f"  Unassigned nodes: {len(unassigned)}")
+    unassigned_graph = graph.subgraph(unassigned)
+    
+    # Counter for new species without reference
+    new_species_counter = 1
+    
+    # Process connected components
+    for comp in nx.connected_components(unassigned_graph):
+        # Search for EXACT reference in component (highest priority)
+        ref_label = None
+        ref_found = False
+        for node in comp:
+            if node in references:
+                ref_label = references[node]
+                ref_found = True
+                logger.info(f"  EXACT REFERENCE in community: {node[:15]} => {ref_label}")
+                break
+        
+        # Assign name to component
+        if ref_found:
+            species_name = ref_label
+        else:
+            # Search reference by short ID (second priority)
+            found_ref = False
+            for node in comp:
+                short_id = node[:15]
+                if short_id in short_ref_dict:
+                    species_name = short_ref_dict[short_id]
+                    found_ref = True
+                    logger.info(f"  REFERENCE BY SHORT ID in community: {short_id} => {species_name}")
+                    break
+            
+            if found_ref:
+                # Use the found name
+                pass
+            else:
+                # NEW SPECIES WITHOUT REFERENCE: Bacillus sppX
+                species_name = f"Bacillus spp{new_species_counter}"
+                new_species_counter += 1
+                logger.info(f"  WITHOUT REFERENCE: New species {species_name}")
+        
+        # Assign name to all nodes in component
+        for node in comp:
+            consensus_labels[node] = species_name
+    
+    # Handle isolated nodes (without connections)
+    isolated = [node for node in unassigned if node not in set.union(*[set(c) for c in nx.connected_components(unassigned_graph)])]
+    for node in isolated:
+        # Priority 1: Exact reference
+        if node in references:
+            species_name = references[node]
+            logger.info(f"  Isolated EXACT REFERENCE: {node[:15]} => {species_name}")
+        
+        # Priority 2: Reference by short ID
+        else:
+            short_id = node[:15]
+            if short_id in short_ref_dict:
+                species_name = short_ref_dict[short_id]
+                logger.info(f"  Isolated REFERENCE BY SHORT ID: {short_id} => {species_name}")
+            
+            # Priority 3: Propagated label (if exists)
+            elif graph.nodes[node].get('label'):
+                species_name = graph.nodes[node]['label']
+                logger.info(f"  Isolated propagated label: {node[:15]} => {species_name}")
+            
+            # Priority 4: New species without reference
+            else:
+                species_name = f"Bacillus spp{new_species_counter}"
+                new_species_counter += 1
+                logger.info(f"  Isolated WITHOUT REFERENCE: {node[:15]} => {species_name}")
+        
+        consensus_labels[node] = species_name
+    
+    logger.info(f"Grouped {len(unassigned)} nodes into {new_species_counter-1} new species")
+    return consensus_labels
+
+# =============
+# VISUALIZATION
+# =============
+def generate_network_plot(graph, species_assignments, references, output_dir):
+    """Generates a network visualization of identified communities"""
+    logger.info("Generating network visualization...")
+    
+    # Prepare data for visualization
+    species = set(species_assignments.values())
+    color_palette = sns.color_palette("husl", len(species))
+    species_colors = {sp: color_palette[i] for i, sp in enumerate(species)}
+    
+    # Create figure
+    plt.figure(figsize=(15, 12))
+    
+    # Calculate positions
+    pos = nx.spring_layout(graph, seed=SEED, k=0.15)
+    
+    # Draw edges
+    nx.draw_networkx_edges(graph, pos, alpha=0.1, width=0.5)
+    
+    # Draw nodes by species
+    for species_name, color in species_colors.items():
+        nodes = [node for node in graph.nodes if species_assignments[node] == species_name]
+        nx.draw_networkx_nodes(
+            graph, pos, nodelist=nodes,
+            node_color=[color] * len(nodes),
+            node_size=100,
+            alpha=0.9,
+            label=species_name
+        )
+    
+    # Highlight reference nodes
+    ref_nodes = [node for node in graph.nodes if node in references]
+    if ref_nodes:
+        nx.draw_networkx_nodes(
+            graph, pos, nodelist=ref_nodes,
+            node_color='gold',
+            node_size=200,
+            edgecolors='red',
+            linewidths=1.5,
+            node_shape='s'
+        )
+    
+    # Add labels only for references
+    labels = {node: node[:10] + '...' for node in ref_nodes}
+    nx.draw_networkx_labels(graph, pos, labels, font_size=8)
+    
+    # Create custom legend
+    legend_elements = [
+        plt.Line2D([0], [0], marker='o', color='w', markerfacecolor=color, markersize=10, label=textwrap.fill(species_name, 30))
+        for species_name, color in species_colors.items()
+    ]
+    
+    # Add element for references
+    legend_elements.append(
+        plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='gold', 
+                   markeredgecolor='red', markersize=10, label='References')
+    )
+    
+    plt.legend(handles=legend_elements, loc='best', fontsize=8)
+    plt.title(f"Microbial Communities by ANI (≥{ANI_SPECIES_THRESHOLD*100}%)", fontsize=14)
+    plt.axis('off')
+    
+    # Save figure
+    network_path = os.path.join(output_dir, "species_network.png")
+    plt.savefig(network_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f"Network visualization saved at: {network_path}")
+    return network_path
+
+def generate_ani_heatmap(ani_matrix, species_assignments, output_dir):
+    """Generates an ANI matrix heatmap clustered by species"""
+    logger.info("Generating ANI heatmap...")
+    
+    # Shorten IDs for visualization
+    short_ids = {gid: gid[:15] for gid in ani_matrix.index}
+    
+    # Create assignments DataFrame
+    assignments = pd.DataFrame({
+        'Genome': species_assignments.keys(),
+        'Species': species_assignments.values(),
+        'ShortID': [short_ids[gid] for gid in species_assignments.keys()]
+    }).set_index('Genome')
+    
+    # Sort by species
+    assignments = assignments.sort_values(by=['Species', 'Genome'])
+    
+    # Reorder matrix according to assignments
+    ordered_matrix = ani_matrix.loc[assignments.index, assignments.index]
+    
+    # Create figure
+    plt.figure(figsize=(15, 13))
+    
+    # Calculate linkage for hierarchical clustering
+    condensed_dist = pdist(ordered_matrix, metric='euclidean')
+    Z = hierarchy.linkage(condensed_dist, method='average')
+    
+    # Create clustermap
+    species_labels = assignments['Species'].values
+    species_palette = sns.color_palette("husl", len(set(species_labels)))
+    species_to_color = dict(zip(sorted(set(species_labels)), species_palette))
+    row_colors = [species_to_color[sp] for sp in species_labels]
+    
+    g = sns.clustermap(
+        ordered_matrix,
+        row_linkage=Z,
+        col_linkage=Z,
+        cmap="viridis",
+        vmin=ANI_SPECIES_THRESHOLD - 0.1,
+        vmax=1.0,
+        row_colors=row_colors,
+        col_colors=row_colors,
+        yticklabels=[short_ids.get(idx, idx) for idx in ordered_matrix.index],
+        xticklabels=False,
+        figsize=(15, 13)
+    )
+    
+    # Configure species legend
+    legend_patches = [Patch(color=color, label=textwrap.fill(sp, 30)) for sp, color in species_to_color.items()]
+    plt.legend(handles=legend_patches, 
+               title='Species', 
+               bbox_to_anchor=(1.02, 1), # Before 1.05
+               loc='upper left',
+               fontsize=8)
+    
+    plt.title(f"ANI Matrix clustered by species (n={len(ordered_matrix)})", fontsize=14)
+    
+    # Save figure
+    heatmap_path = os.path.join(output_dir, "ani_species_heatmap.png")
+    plt.savefig(heatmap_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f"✔ Heatmap saved at: {heatmap_path}")
+    return heatmap_path
+
+# ==========
+# RESULTS
+# ==========
+def generate_output_files(graph, consensus_labels, references, short_ref_dict, ani_matrix, output_dir):
+    """Generates CSV files with final results"""
+    logger.info("Generating result files...")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create short version of IDs
+    short_ids = {gid: gid[:15] for gid in consensus_labels.keys()}
+    
+    # Main assignment file
+    results = []
+    for genome, label in consensus_labels.items():
+        ref_species = references.get(genome, "N/A")
+        short_id = short_ids[genome]
+        
+        # Verify assignment type
+        assignment_type = "New species"
+        if genome in references:
+            assignment_type = "Exact reference"
+        elif short_id in short_ref_dict and short_ref_dict[short_id] == label:
+            assignment_type = "Reference by short ID"
+        elif "Bacillus spp" in label:
+            assignment_type = "Proposed new species"
+        
+        results.append({
+            'Genome': genome,
+            'ShortID': short_id,
+            'Assigned_Species': label,
+            'Reference_Species': ref_species,
+            'Assignment_Type': assignment_type,
+            'Type': 'Reference' if genome in references else 'Query'
+        })
+    
+    results_df = pd.DataFrame(results)
+    main_output = os.path.join(output_dir, "ani_species_results.csv")
+    results_df.to_csv(main_output, index=False, encoding='utf-8-sig')
+    logger.info(f"Results saved at: {main_output}")
+    
+    # Species summary file
+    cluster_summary = defaultdict(list)
+    shortid_summary = defaultdict(list)
+    for genome, label in consensus_labels.items():
+        cluster_summary[label].append(genome)
+        shortid_summary[label].append(short_ids[genome])
+    
+    summary_data = []
+    for species, genomes in cluster_summary.items():
+        # Count references in the species
+        ref_count = sum(1 for g in genomes if g in references)
+        
+        # Determine species type
+        species_type = "Referenced"
+        if "Bacillus spp" in species:
+            species_type = "New proposed"
+        
+        summary_data.append({
+            'Species': species,
+            'Species_Type': species_type,
+            'Num_Genomes': len(genomes),
+            'Reference_Count': ref_count,
+            'Genomes': ';'.join(genomes),
+            'ShortIDs': ';'.join(shortid_summary[species])
+        })
+    
+    summary_df = pd.DataFrame(summary_data)
+    summary_output = os.path.join(output_dir, "species_summary.csv")
+    summary_df.to_csv(summary_output, index=False)
+    logger.info(f"✔ Species summary saved at: {summary_output}")
+    
+    # Generate visualizations
+    try:
+        generate_ani_heatmap(ani_matrix, consensus_labels, output_dir)
+        generate_network_plot(graph, consensus_labels, references, output_dir)
+    except Exception as e:
+        logger.error(f"Error generating visualizations: {str(e)}")
+    
+    # Verify reference assignment
+    correct_refs = 0
+    for genome in references:
+        if genome in consensus_labels:
+            if consensus_labels[genome] == references[genome]:
+                correct_refs += 1
+            else:
+                logger.warning(f"  ¡WARNING! Reference {genome[:15]} assigned incorrectly")
+                logger.warning(f"    Expected: {references[genome]}")
+                logger.warning(f"    Got: {consensus_labels[genome]}")
+    
+    logger.info(f"References correctly assigned: {correct_refs}/{len(references)}")
+    
+    return main_output, summary_output
+
+# ===============
+# MAIN FLOW
+# ===============
+def main():
+    start_time = time.time()
+    logger.info("="*70)
+    logger.info("SPECIES DELINEATION BASED ON ANI (FASTANI)")
+    logger.info(f"ANI threshold: {ANI_SPECIES_THRESHOLD*100:.1f}%")
+    logger.info("="*70)
+    
+    try:
+        # Step 1: Load data
+        logger.info("\n[STEP 1/3] Loading data...")
+        references, short_ref_dict = load_gtdb_references(GTDB_REF_FILE)
+        ani_matrix = load_fastani_results(FASTANI_RESULTS)  # Updated function
+        
+        # Verify name matching
+        common = set(references.keys()) & set(ani_matrix.index)
+        logger.info(f"References in ANI matrix: {len(common)}/{len(references)}")
+        if len(common) < len(references):
+            missing = set(references.keys()) - set(ani_matrix.index)
+            logger.warning(f"Missing references: {', '.join(list(missing)[:5])}...")
+        
+        # Step 2: Build communities and assign names
+        logger.info("\n[STEP 2/3] Delineating species...")
+        graph = build_ani_graph(ani_matrix)
+        
+        # Label propagation for connected communities
+        graph = label_propagation(graph, references)
+        consensus_labels = {node: graph.nodes[node].get('label') for node in graph.nodes}
+        
+        # Handle unconnected communities with improved logic
+        consensus_labels = cluster_unassigned_nodes(graph, consensus_labels, references, short_ref_dict)
+        
+        # Step 3: Results
+        logger.info("\n[STEP 3/3] Generating results...")
+        generate_output_files(graph, consensus_labels, references, short_ref_dict, ani_matrix, FASTANI_DIR)  # Use FASTANI_DIR as output
+        
+        # Final summary
+        species_types = defaultdict(int)
+        for species in set(consensus_labels.values()):
+            if "Bacillus spp" in species:
+                species_types["Proposed new species"] += 1
+            else:
+                species_types["Species with reference"] += 1
+        
+        logger.info("\n" + "="*70)
+        logger.info("FINAL SUMMARY")
+        logger.info("="*70)
+        logger.info(f"Total genomes processed: {len(consensus_labels)}")
+        logger.info(f"Total species identified: {len(set(consensus_labels.values()))}")
+        logger.info(f"  - Species with reference: {species_types['Species with reference']}")
+        logger.info(f"  - Proposed new species: {species_types['Proposed new species']}")
+        logger.info(f"Total time: {time.time() - start_time:.2f} seconds")
+        logger.info("="*70)
+
+    except Exception as e:
+        logger.error("\nERROR: " + str(e))
+        import traceback
+        logger.error(traceback.format_exc())
+
+if __name__ == "__main__":
+    main()
