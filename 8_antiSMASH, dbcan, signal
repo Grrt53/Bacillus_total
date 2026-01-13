@@ -18,7 +18,7 @@ INPUT_DIR="/XXXXX/XXXXX/XXXXX/bacillus_spp/10_anti_mash/genomas_gbk/genomas_tota
 OUTPUT_DIR="/XXXXX/XXXXXX/XXXXX/bacillus_spp/10_anti_mash/genomas_gbk/results_anti_mash"
 LOG_DIR="${OUTPUT_DIR}/logs"
 THREADS=40
-CPUS_PER_GENOME=2   # Núcleos por genoma
+CPUS_PER_GENOME=2 
 
 # ==============================================================================
 # PREPARATION OF DIRECTORIES
