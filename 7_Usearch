@@ -1,0 +1,1516 @@
+############# HJ ############################
+# Install
+conda create -n usearch_env
+conda activate usearch_env
+
+# Download from their main website
+https://www.drive5.com/
+
+# Make it executable
+chmod +x usearch11.0.667_i86linux32
+
+# Switch to the conda environment
+mv usearch11.0.667_i86linux32 $CONDA_PREFIX/bin/usearch
+
+##############################################
+#### Example of large-scale Usearch #########
+
+# Use of large-scale identifiers
+#'''''''''''''''''''''''''''''''''''''''''''#
+#!/bin/bash
+
+set -euo pipefail
+
+# ========== CONFIGURATION ==========
+PROJECT_DIR="/XXXX/XXXXX/XXXX/bacillus_spp"
+FAA_DIR="$PROJECT_DIR/archivos_faa"
+METADATA_ODS="$PROJECT_DIR/doc_Bacillus/bacillus_otro.ods"
+OUT_DIR="$PROJECT_DIR/0_genes_antifungicos"
+DB_DIR="$PROJECT_DIR/databases"
+R_SCRIPT="$PROJECT_DIR/scripts/analysis_only_ANTIFUNGAL_FINAL.R"
+VIS_SCRIPT="$PROJECT_DIR/scripts/visualisation_functions_ANTIFUNGAL_FINAL.R"
+LOG_DIR="$OUT_DIR/logs"
+TEMP_DIR="$OUT_DIR/temp"
+
+# ========== INITIALIZATION ==========
+echo "=== PIPELINE - ANTIFUNGAL GENE ANALYSIS ==="
+echo "Start date: $(date '+%Y-%m-%d %H:%M:%S')"
+echo "Working directory: $PWD"
+
+# Create necessary directories
+mkdir -p "$OUT_DIR/usearch" "$OUT_DIR/r_results" "$LOG_DIR" "$TEMP_DIR"
+
+# Configure locale for decimals
+export LC_NUMERIC="en_US.UTF-8"
+export LC_ALL="en_US.UTF-8"
+
+# ========== AUXILIARY FUNCTIONS ==========
+get_genome_id() {
+    local filename=$(basename "$1")
+    local genome_id
+    
+    # Extract GC[FA]_[0-9]+\.[0-9]+
+    genome_id=$(echo "$filename" | grep -o 'GC[FA]_[0-9]\+\.[0-9]\+')
+    
+    if [ -z "$genome_id" ]; then
+        # Fallback: filename without extension
+        genome_id=$(basename "$filename" .faa)
+        echo "WARNING: Non-standard ID in $filename, using: $genome_id" >&2
+    fi
+    
+    echo "$genome_id"
+}
+
+check_environment() {
+    echo "=== VERIFYING ENVIRONMENT ==="
+    
+    # Essential commands
+    for cmd in usearch11 Rscript parallel; do
+        if ! command -v $cmd &>/dev/null; then
+            echo "ERROR: Command not found: $cmd"
+            exit 1
+        fi
+    done
+    
+    # Directories and files
+    local missing_items=()
+    
+    [ ! -d "$FAA_DIR" ] && missing_items+=("$FAA_DIR")
+    [ ! -d "$DB_DIR" ] && missing_items+=("$DB_DIR")
+    [ ! -f "$METADATA_ODS" ] && missing_items+=("$METADATA_ODS")
+    [ ! -f "$R_SCRIPT" ] && missing_items+=("$R_SCRIPT")
+    [ ! -f "$VIS_SCRIPT" ] && missing_items+=("$VIS_SCRIPT")
+    [ ! -f "$DB_DIR/genes_antifungicos.udb" ] && missing_items+=("$DB_DIR/genes_antifungicos.udb")
+    
+    if [ ${#missing_items[@]} -gt 0 ]; then
+        echo "ERROR: Items not found:"
+        printf '  - %s\n' "${missing_items[@]}"
+        exit 1
+    fi
+    
+    # Verify FAA files
+    local faa_count=$(find "$FAA_DIR" -name '*.faa' -type f | wc -l)
+    if [ "$faa_count" -eq 0 ]; then
+        echo "ERROR: No .faa files in $FAA_DIR"
+        exit 1
+    fi
+    
+    echo "Environment verified: $faa_count .faa files found"
+}
+
+# ========== MAIN PROCESSING FUNCTION ==========
+process_sample() {
+    local faa_file="$1"
+    local genome_id=$(get_genome_id "$faa_file")
+    local log_file="$LOG_DIR/${genome_id}.log"
+    
+    # Start log
+    cat > "$log_file" << EOF
+=== PROCESSING GENOME: $genome_id ===
+File: $(basename "$faa_file")
+Start: $(date '+%Y-%m-%d %H:%M:%S')
+EOF
+    
+    # USEARCH parameters (consistent with R filters)
+    local common_params="-id 0.6 -query_cov 0.5 -target_cov 0.5 -threads 2 -maxhits 1 -top_hits_only"
+    local db_key="genes_antifungicos"
+    local output_raw="$TEMP_DIR/${genome_id}_${db_key}_raw.txt"
+    local output_final="$OUT_DIR/usearch/${genome_id}_${db_key}.tsv"
+    
+    echo "  - Database search: $db_key" | tee -a "$log_file"
+    
+    # Execute USEARCH
+    if ! usearch11 -usearch_global "$faa_file" \
+        -db "$DB_DIR/${db_key}.udb" \
+        $common_params \
+        -userout "$output_raw" \
+        -userfields "query+target+alnlen+ql+tl+id+evalue" \
+        >> "$log_file" 2>&1; then
+        
+        echo "Error in usearch for $genome_id" | tee -a "$log_file"
+        # Create empty file with header
+        printf "Query\tTarget\tAlnLen\tQLen\tTLen\tPctID\tEvalue\tQCov\tTCov\n" > "$output_final"
+        return 1
+    fi
+    
+    # Process results with AWK - CORRECTED
+    if [[ -s "$output_raw" ]]; then
+        # Filter empty lines and ensure format
+        awk -F"\t" -v OFS="\t" '
+        BEGIN {
+            print "Query", "Target", "AlnLen", "QLen", "TLen", "PctID", "Evalue", "QCov", "TCov"
+        }
+        NR > 0 && NF >= 7 {
+            # Clean fields and convert decimals
+            gsub(/[[:space:]]+$/, "", $1)  # Query
+            gsub(/[[:space:]]+$/, "", $2)  # Target
+            
+            # Convert numeric values (handle commas and dots)
+            gsub(",", ".", $3)  # AlnLen
+            gsub(",", ".", $4)  # QLen
+            gsub(",", ".", $5)  # TLen
+            gsub(",", ".", $6)  # PctID
+            gsub(",", ".", $7)  # Evalue
+            
+            # Ensure they are numbers
+            alnlen = $3 + 0
+            qlen = $4 + 0
+            tlen = $5 + 0
+            pctid = $6 + 0
+            
+            # Calculate coverages only if lengths > 0
+            qcov = 0
+            tcov = 0
+            if (qlen > 0) qcov = (alnlen / qlen) * 100
+            if (tlen > 0) tcov = (alnlen / tlen) * 100
+            
+            # Apply filters (id ≥60%, cov ≥50%)
+            if (qcov >= 50 && tcov >= 50 && pctid >= 60) {
+                printf "%s\t%s\t%d\t%d\t%d\t%.2f\t%s\t%.2f\t%.2f\n", 
+                    $1, $2, alnlen, qlen, tlen, pctid, $7, qcov, tcov
+            }
+        }' "$output_raw" > "$output_final"
+        
+        # Count valid hits
+        hits_count=$(tail -n +2 "$output_final" 2>/dev/null | wc -l)
+        echo "Valid hits: $hits_count" | tee -a "$log_file"
+    else
+        echo "No hits" | tee -a "$log_file"
+        # Empty file with header
+        printf "Query\tTarget\tAlnLen\tQLen\tTLen\tPctID\tEvalue\tQCov\tTCov\n" > "$output_final"
+        hits_count=0
+    fi
+    
+    # Cleanup
+    rm -f "$output_raw"
+    
+    # Finalize log
+    cat >> "$log_file" << EOF
+Result file: $(basename "$output_final")
+Hits found: $hits_count
+End: $(date '+%Y-%m-%d %H:%M:%S')
+=== PROCESS COMPLETED ===
+EOF
+}
+
+# ========== MAIN EXECUTION ==========
+main() {
+    # 1. Verify environment
+    check_environment
+    
+    # 2. Copy visualization script
+    echo -e "\n=== PREPARING SCRIPTS ==="
+    cp -f "$VIS_SCRIPT" "$DB_DIR/visualisation_functions_ANTIFUNGAL_FINAL.R"
+    echo "Visualization script copied"
+    
+    # 3. List FAA files
+    echo -e "\n=== FINDING FAA FILES ==="
+    mapfile -t faa_files < <(find "$FAA_DIR" -name '*.faa' -type f | sort)
+    total_samples=${#faa_files[@]}
+    echo "Files to process: $total_samples"
+    
+    # 4. Process in parallel
+    echo -e "\n=== USEARCH PROCESSING (PARALLEL) ==="
+    
+    # Calculate optimal jobs
+    available_cores=$(nproc)
+    jobs_count=$((available_cores * 80 / 100))
+    jobs_count=$((jobs_count < 1 ? 1 : jobs_count))
+    jobs_count=$((jobs_count > 36 ? 36 : jobs_count))
+    
+    echo "Parallel jobs: $jobs_count"
+    
+    # Export functions/variables for GNU Parallel
+    export -f process_sample get_genome_id
+    export OUT_DIR DB_DIR LOG_DIR TEMP_DIR
+    
+    # Execute in parallel with better error handling
+    printf '%s\n' "${faa_files[@]}" | parallel \
+        --progress \
+        --bar \
+        --eta \
+        --jobs "$jobs_count" \
+        --memfree 2G \
+        --load 80% \
+        --retries 2 \
+        --halt now,fail=10% \
+        --joblog "$LOG_DIR/parallel_jobs.log" \
+        "process_sample {}" 2>&1 | tee "$LOG_DIR/parallel_output.log"
+    
+    # 5. Verify USEARCH results
+    echo -e "\n=== VERIFYING USEARCH RESULTS ==="
+    mapfile -t result_files < <(find "$OUT_DIR/usearch" -name '*.tsv' -type f)
+    result_count=${#result_files[@]}
+    
+    if [[ $result_count -eq 0 ]]; then
+        echo "WARNING: No result files"
+        # Create empty files for all samples
+        for faa in "${faa_files[@]}"; do
+            genome_id=$(get_genome_id "$faa")
+            output_file="$OUT_DIR/usearch/${genome_id}_genes_antifungicos.tsv"
+            if [[ ! -f "$output_file" ]]; then
+                printf "Query\tTarget\tAlnLen\tQLen\tTLen\tPctID\tEvalue\tQCov\tTCov\n" > "$output_file"
+            fi
+        done
+    else
+        # Count total hits
+        total_hits=0
+        for file in "${result_files[@]}"; do
+            if [[ -s "$file" ]]; then
+                hits=$(tail -n +2 "$file" 2>/dev/null | wc -l)
+                total_hits=$((total_hits + hits))
+            fi
+        done
+        echo "Files generated: $result_count"
+        echo "Total hits found: $total_hits"
+    fi
+    
+    # 6. Execute R analysis
+    echo -e "\n=== EXECUTING R ANALYSIS ==="
+    if Rscript --vanilla "$R_SCRIPT" "$METADATA_ODS" "$OUT_DIR" "$DB_DIR" 2>&1 | tee "$LOG_DIR/R_analysis.log"; then
+        echo "R analysis completed"
+    else
+        echo "Error in R analysis"
+        exit 1
+    fi
+    
+    # 7. Cleanup and final report
+    echo -e "\n=== FINALIZING ==="
+    
+    # Clean temporary
+    if [[ -d "$TEMP_DIR" ]]; then
+        rm -rf "$TEMP_DIR"
+        echo "Temporary directory cleaned"
+    fi
+    
+    # Disk usage report
+    echo -e "\n=== DISK USAGE ==="
+    du -sh "$OUT_DIR"/*
+    
+    # List generated files
+    echo -e "\n=== GENERATED FILES ==="
+    find "$OUT_DIR/r_results" -type f \( -name "*.csv" -o -name "*.png" -o -name "*.pdf" \) | sort | while read file; do
+        if [[ -f "$file" ]]; then
+            size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
+            printf "  %-45s %10s\n" "$(basename "$file")" "$(numfmt --to=iec --suffix=B "$size" 2>/dev/null || echo "${size}B")"
+        fi
+    done
+    
+    echo -e "\n=== PIPELINE SUCCESSFULLY COMPLETED ==="
+    echo "End date: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "Results directory: $OUT_DIR"
+    echo "Logs: $LOG_DIR"
+    echo "Total samples processed: $total_samples"
+}
+
+# Execute with error capture
+mkdir -p "$LOG_DIR"
+if ! main 2>&1 | tee "$LOG_DIR/pipeline_master.log"; then
+    echo "Pipeline failed"
+    exit 1
+fi
+
+###########################################################################################################################################
+############################## Data analysis in R, use of presence and absence for large-scale data #######################################
+
+#!/usr/bin/env Rscript
+
+# ========== CONFIGURATION ==========
+args <- commandArgs(trailingOnly = TRUE)
+if (length(args) < 3) {
+  cat("Usage: Rscript analysis_only_ANTIFUNGAL_FINAL.R <METADATA_ODS> <OUT_DIR> <DB_DIR>\n")
+  cat("Example: Rscript script.R /path/metadata.ods /path/output /path/databases\n")
+  quit(status = 1)
+}
+
+metadata_ods <- args[1]
+out_dir <- args[2]
+db_dir <- args[3]
+
+# Directories
+usearch_dir <- file.path(out_dir, "usearch")
+r_out <- file.path(out_dir, "r_results")
+antifungal_meta_path <- file.path(db_dir, "antifungos_base.ods") 
+
+# Create directories
+dir.create(r_out, showWarnings = FALSE, recursive = TRUE)
+
+cat("========================================\n")
+cat("ANALYSIS OF ANTIFUNGAL GENES\n")
+cat("========================================\n")
+cat("R output directory:", r_out, "\n")
+cat("Date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n\n")
+
+# ========== PACKAGE LOADING ==========
+required_packages <- c(
+  "tidyverse", "readODS", "data.table", "future", "furrr",
+  "pheatmap", "viridis", "stringr", "R.utils"
+)
+
+install_missing <- function(packages) {
+  new_pkgs <- packages[!packages %in% installed.packages()[, "Package"]]
+  if (length(new_pkgs) > 0) {
+    cat("Installing packages:", paste(new_pkgs, collapse = ", "), "\n")
+    install.packages(new_pkgs, repos = "https://cloud.r-project.org", quiet = TRUE)
+  }
+  
+  # Load silently
+  suppressPackageStartupMessages({
+    for (pkg in packages) {
+      if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+        stop("Error loading: ", pkg)
+      }
+    }
+  })
+}
+
+tryCatch({
+  install_missing(required_packages)
+}, error = function(e) {
+  cat("ERROR loading packages:", e$message, "\n")
+  quit(status = 1)
+})
+
+# Configure parallel processing
+tryCatch({
+  plan(multisession, workers = max(1, min(4, future::availableCores() - 2)))
+  cat("Parallel processing: ", future::nbrOfWorkers(), " workers\n")
+}, error = function(e) {
+  cat("Sequential processing (parallel error:", e$message, ")\n")
+  plan(sequential)
+})
+
+# ========== AUXILIARY FUNCTIONS ==========
+load_antifungal_metadata <- function(path) {
+  if (!file.exists(path)) {
+    cat("WARNING: File not found:", path, "\n")
+    return(NULL)
+  }
+  
+  tryCatch({
+    meta <- readODS::read_ods(path, sheet = 1)
+    
+    # Verify structure
+    if (ncol(meta) < 4) {
+      cat("WARNING: Metadata has only", ncol(meta), "columns (expected ≥4)\n")
+      print(head(meta))
+      return(NULL)
+    }
+    
+    # Assign standard names - according to example
+    colnames(meta)[1:4] <- c("Cod_Ref", "Gene_Acronym", "Gene_Name", "Antifungal_Mechanism")
+    
+    cat("First rows of metadata:\n")
+    print(head(meta))
+    
+    # Clean and prepare
+    meta <- meta %>%
+      filter(!is.na(Cod_Ref) & Cod_Ref != "") %>%
+      distinct(Cod_Ref, .keep_all = TRUE) %>%
+      mutate(
+        Cod_Ref = as.character(Cod_Ref),
+        Gene_Acronym = ifelse(is.na(Gene_Acronym) | Gene_Acronym == "", 
+                              paste0("GENE_", Cod_Ref), as.character(Gene_Acronym)),
+        Gene_Name = ifelse(is.na(Gene_Name) | Gene_Name == "", 
+                           Gene_Acronym, as.character(Gene_Name)),
+        Antifungal_Mechanism = ifelse(is.na(Antifungal_Mechanism) | Antifungal_Mechanism == "",
+                                      "Unknown", as.character(Antifungal_Mechanism))
+      )
+    
+    cat("Antifungal metadata loaded\n")
+    cat("  - Records:", nrow(meta), "\n")
+    cat("  - Unique genes:", n_distinct(meta$Gene_Acronym), "\n")
+    cat("  - Unique mechanisms:", n_distinct(meta$Antifungal_Mechanism), "\n")
+    
+    return(meta)
+  }, error = function(e) {
+    cat("ERROR loading metadata:", e$message, "\n")
+    return(NULL)
+  })
+}
+
+read_metadata <- function(path) {
+  tryCatch({
+    if (!file.exists(path)) {
+      stop("File not found: ", path)
+    }
+    
+    meta <- readODS::read_ods(path, sheet = 1)
+    
+    if (ncol(meta) < 2) {
+      stop("At least 2 columns are required (ID and Species)")
+    }
+    
+    # Assign names
+    colnames(meta)[1:2] <- c("ID", "Species")
+    
+    cat("Metadata structure:\n")
+    print(str(meta))
+    cat("First rows:\n")
+    print(head(meta))
+    
+    # Process
+    meta <- meta %>%
+      mutate(
+        Genome_ID = str_extract(ID, "GC[FA]_[0-9]+\\.[0-9]+"),
+        Species = trimws(as.character(Species)),
+        Species_Label = Species,
+        .before = everything()
+      ) %>%
+      filter(!is.na(Species) & Species != "") %>%
+      distinct(Genome_ID, .keep_all = TRUE)
+    
+    # Verify missing IDs
+    missing_species <- meta %>% filter(is.na(Species) | Species == "")
+    if (nrow(missing_species) > 0) {
+      cat("WARNING: Missing species in", nrow(missing_species), "genomes\n")
+    }
+    
+    cat("Genome metadata loaded\n")
+    cat("  - Total genomes:", nrow(meta), "\n")
+    cat("  - Unique species:", n_distinct(meta$Species), "\n")
+    cat("  - Without Genome_ID:", sum(is.na(meta$Genome_ID)), "\n")
+    
+    return(meta)
+  }, error = function(e) {
+    cat("ERROR reading metadata:", e$message, "\n")
+    quit(status = 1)
+  })
+}
+
+# ========== METADATA LOADING ==========
+cat("\n=== METADATA LOADING ===\n")
+metadata <- read_metadata(metadata_ods)
+
+# ========== USEARCH RESULTS PROCESSING ==========
+read_ush_results <- function(dir_path) {
+  cat("Searching results in:", dir_path, "\n")
+  
+  files <- list.files(
+    dir_path,
+    pattern = "\\.tsv$",
+    full.names = TRUE,
+    recursive = FALSE
+  )
+  
+  if (length(files) == 0) {
+    cat("WARNING: No .tsv files in", dir_path, "\n")
+    return(data.frame())
+  }
+  
+  cat("Files found:", length(files), "\n")
+  
+  process_file <- function(file_path) {
+    genome_id <- str_extract(basename(file_path), "GC[FA]_[0-9]+\\.[0-9]+")
+    
+    if (is.na(genome_id)) {
+      cat(" Could not extract genome_id from:", basename(file_path), "\n")
+      return(data.frame())
+    }
+    
+    tryCatch({
+      # Verify file is not empty
+      file_info <- file.info(file_path)
+      if (file_info$size == 0) {
+        cat(" Empty file:", basename(file_path), "\n")
+        return(data.frame())
+      }
+      
+      # Read file
+      dt <- fread(
+        file_path,
+        sep = "\t",
+        header = TRUE,
+        na.strings = c("", "NA", "N/A", ".", "NaN"),
+        colClasses = "character",
+        fill = TRUE,
+        quote = ""
+      )
+      
+      # Verify basic structure
+      if (nrow(dt) == 0 || ncol(dt) == 0) {
+        return(data.frame())
+      }
+      
+      # Required columns
+      required_cols <- c("Query", "Target", "PctID", "QCov", "TCov")
+      missing_cols <- setdiff(required_cols, colnames(dt))
+      if (length(missing_cols) > 0) {
+        cat(" XHJX ", basename(file_path), ": Missing columns:", 
+            paste(missing_cols, collapse = ", "), "\n")
+        return(data.frame())
+      }
+      
+      # Convert numeric columns (handle decimal commas)
+      num_cols <- c("PctID", "QCov", "TCov", "AlnLen", "QLen", "TLen")
+      for (col in intersect(num_cols, colnames(dt))) {
+        dt[[col]] <- as.numeric(gsub(",", ".", dt[[col]]))
+      }
+      
+      # Filter valid hits (consistent with shell filters)
+      dt <- dt %>%
+        filter(
+          !is.na(PctID) & !is.na(QCov) & !is.na(TCov),
+          QCov >= 50, TCov >= 50, PctID >= 60,
+          !is.na(Target) & Target != ""
+        )
+      
+      if (nrow(dt) == 0) {
+        return(data.frame())
+      }
+      
+      # Add metadata
+      dt %>%
+        mutate(
+          Genome_ID = genome_id,
+          Type = "Antifungal_Genes",
+          File = basename(file_path),
+          .before = everything()
+        )
+      
+    }, error = function(e) {
+      cat("Error processing", basename(file_path), ":", e$message, "\n")
+      return(data.frame())
+    })
+  }
+  
+  # Process in parallel
+  cat("Processing files...\n")
+  results <- future_map_dfr(files, process_file, 
+                            .progress = TRUE, 
+                            .options = furrr_options(seed = TRUE))
+  
+  cat("\n=== RESULTS SUMMARY ===\n")
+  cat("Files processed:", length(files), "\n")
+  cat("Genomes with hits:", n_distinct(results$Genome_ID), "\n")
+  cat("Total hits:", nrow(results), "\n")
+  
+  if (nrow(results) == 0) {
+    cat("WARNING: No valid hits found\n")
+  }
+  
+  return(results)
+}
+
+cat("\n=== PROCESSING USEARCH RESULTS ===\n")
+results <- read_ush_results(usearch_dir)
+
+# ========== ENHANCE AND ANNOTATE RESULTS ==========
+cat("\n=== ENHANCING RESULTS ===\n")
+
+if (nrow(results) == 0) {
+  cat("No data to enhance, creating empty structure\n")
+  
+  results <- data.frame(
+    Genome_ID = character(),
+    Type = character(),
+    Query = character(),
+    Target = character(),
+    PctID = numeric(),
+    QCov = numeric(),
+    TCov = numeric(),
+    Evalue = character(),
+    Species = character(),
+    Gene_Acronym = character(),
+    Gene_Name = character(),
+    Antifungal_Mechanism = character(),
+    stringsAsFactors = FALSE
+  )
+} else {
+  # 1. Join with species metadata
+  results <- results %>%
+    left_join(metadata %>% select(Genome_ID, Species), by = "Genome_ID") %>%
+    mutate(
+      Species = ifelse(is.na(Species) | Species == "", "Unknown_Species", Species)
+    )
+  
+  # 2. Load antifungal gene metadata
+  antifungal_meta <- load_antifungal_metadata(antifungal_meta_path)
+  
+  # 3. EXTRACT IDENTIFIERS - IMPROVED VERSION
+  cat("Extracting gene identifiers...\n")
+  
+  # Robust function to extract Cod_Ref
+  extract_cod_ref <- function(target) {
+    if (is.na(target) || target == "") return(NA_character_)
+    
+    # Pattern 1: tr|B0FZ40|B0FZ40_BACAM (extract B0FZ40)
+    if (grepl("^[a-z]{2,3}\\|[A-Z0-9]+\\|[A-Za-z0-9_]+", target, ignore.case = TRUE)) {
+      cod_ref <- str_extract(target, "(?<=^[a-z]{2,3}\\|)[A-Z0-9]+(?=\\|)")
+      if (!is.na(cod_ref)) return(cod_ref)
+    }
+    
+    # Pattern 2: |ABCD123|... (format with bars)
+    if (grepl("\\|[A-Z0-9]+\\|", target)) {
+      cod_ref <- str_extract(target, "(?<=\\|)[A-Z0-9]+(?=\\|)")
+      if (!is.na(cod_ref)) return(cod_ref)
+    }
+    
+    # Pattern 3: Only code at the beginning (e.g., AAF24188_BACA1)
+    if (grepl("^[A-Z0-9]+_[A-Z0-9]+", target)) {
+      cod_ref <- str_extract(target, "^[A-Z0-9]+(?=_)")
+      if (!is.na(cod_ref)) return(cod_ref)
+    }
+    
+    # Pattern 4: Search for any 6-10 alphanumeric code
+    cod_ref <- str_extract(target, "[A-Z0-9]{6,10}")
+    return(cod_ref)
+  }
+  
+  # Apply extraction
+  results <- results %>%
+    mutate(
+      Cod_Ref = sapply(Target, extract_cod_ref),
+      Gene_Acronym_Target = str_extract(Target, "(?<=GN=)[^\\s]+"),
+      Protein_Desc = str_split(Target, "\\s+") %>% map_chr(~.[1])
+    )
+  
+  cat("Extraction examples:\n")
+  print(head(results %>% select(Target, Cod_Ref, Gene_Acronym_Target), 10))
+  
+  # 4. Join with antifungal gene metadata
+  if (!is.null(antifungal_meta) && nrow(antifungal_meta) > 0) {
+    cat("Joining with gene metadata...\n")
+    
+    # Show matches
+    matches <- sum(results$Cod_Ref %in% antifungal_meta$Cod_Ref, na.rm = TRUE)
+    cat("Matches found:", matches, "of", nrow(results), "\n")
+    
+    results <- results %>%
+      left_join(antifungal_meta, by = "Cod_Ref") %>%
+      mutate(
+        # Assign gene names (priority)
+        Gene_Acronym = case_when(
+          !is.na(Gene_Acronym) & Gene_Acronym != "" ~ Gene_Acronym,
+          !is.na(Gene_Acronym_Target) & Gene_Acronym_Target != "" ~ Gene_Acronym_Target,
+          !is.na(Cod_Ref) ~ Cod_Ref,
+          TRUE ~ "Unknown"
+        ),
+        
+        Gene_Name = case_when(
+          !is.na(Gene_Name) & Gene_Name != "" ~ Gene_Name,
+          !is.na(Gene_Acronym_Target) & Gene_Acronym_Target != "" ~ 
+            paste("Gene", Gene_Acronym_Target),
+          !is.na(Cod_Ref) ~ paste("Gene", Cod_Ref),
+          TRUE ~ "Unknown gene"
+        ),
+        
+        Antifungal_Mechanism = ifelse(
+          is.na(Antifungal_Mechanism) | Antifungal_Mechanism == "",
+          "Unknown mechanism", Antifungal_Mechanism
+        )
+      )
+  } else {
+    cat("No gene metadata, using basic names\n")
+    
+    results <- results %>%
+      mutate(
+        Gene_Acronym = case_when(
+          !is.na(Gene_Acronym_Target) & Gene_Acronym_Target != "" ~ Gene_Acronym_Target,
+          !is.na(Cod_Ref) ~ Cod_Ref,
+          TRUE ~ "Unknown"
+        ),
+        Gene_Name = case_when(
+          !is.na(Gene_Acronym_Target) & Gene_Acronym_Target != "" ~
+            paste("Gene", Gene_Acronym_Target),
+          !is.na(Cod_Ref) ~ paste("Gene", Cod_Ref),
+          TRUE ~ "Unknown gene"
+        ),
+        Antifungal_Mechanism = "Unknown mechanism"
+      )
+  }
+  
+  # Verify extraction
+  cat("\n=== EXTRACTION VERIFICATION ===\n")
+  extraction_stats <- results %>%
+    summarise(
+      Total_hits = n(),
+      With_Cod_Ref = sum(!is.na(Cod_Ref)),
+      With_Gene_Acronym = sum(!is.na(Gene_Acronym) & Gene_Acronym != "Unknown"),
+      Unknown_genes = sum(Gene_Acronym == "Unknown")
+    )
+  
+  print(extraction_stats)
+  
+  # Show mechanism distribution
+  cat("\nAntifungal mechanism distribution:\n")
+  print(table(results$Antifungal_Mechanism))
+}
+
+# ========== SAVE PROCESSED RESULTS ==========
+cat("\n=== SAVING RESULTS ===\n")
+
+output_file <- file.path(r_out, "complete_results.csv")
+fwrite(results, output_file)
+cat("Results saved:", output_file, "\n")
+
+# Also save in RDS format to preserve data types
+saveRDS(results, file.path(r_out, "complete_results.rds"))
+cat("Results saved in RDS\n")
+
+# ========== LOAD VISUALIZATION FUNCTIONS ==========
+vis_functions_path <- file.path(db_dir, "visualisation_functions_ANTIFUNGAL_FINAL.R")
+
+if (!file.exists(vis_functions_path)) {
+  # Search in alternative locations
+  alt_paths <- c(
+    vis_functions_path,
+    file.path(dirname(db_dir), "scripts", "visualisation_functions_ANTIFUNGAL_FINAL.R"),
+    file.path(dirname(metadata_ods), "scripts", "visualisation_functions_ANTIFUNGAL_FINAL.R")
+  )
+  
+  found <- FALSE
+  for (path in alt_paths) {
+    if (file.exists(path)) {
+      vis_functions_path <- path
+      found <- TRUE
+      break
+    }
+  }
+  
+  if (!found) {
+    cat("ERROR: Visualization functions not found\n")
+    cat("Searched in:\n")
+    cat(paste("  -", alt_paths, collapse = "\n"), "\n")
+    quit(status = 1)
+  }
+}
+
+cat("Loading functions from:", vis_functions_path, "\n")
+tryCatch({
+  source(vis_functions_path)
+  cat("Visualization functions loaded\n")
+}, error = function(e) {
+  cat("ERROR loading functions:", e$message, "\n")
+  quit(status = 1)
+})
+
+# ========== EXECUTE ANALYSIS BY CATEGORY ==========
+cat("\n=== EXECUTING VISUAL ANALYSIS ===\n")
+
+categories <- if (nrow(results) > 0) unique(results$Type) else "Antifungal_Genes"
+all_species <- unique(metadata$Species)
+
+cat("Categories:", paste(categories, collapse = ", "), "\n")
+cat("Total species:", length(all_species), "\n")
+
+for (category in categories) {
+  cat("\n--- Processing:", category, "---\n")
+  
+  tryCatch({
+    category_data <- if (category %in% results$Type) {
+      results %>% filter(Type == category)
+    } else {
+      results
+    }
+    
+    generate_category_analysis(
+      data = category_data,
+      output_dir = r_out,
+      category_name = category,
+      additional_meta = antifungal_meta,
+      all_species = all_species
+    )
+    
+    cat("Category completed:", category, "\n")
+  }, error = function(e) {
+    cat("Error in category", category, ":", e$message, "\n")
+    cat("Traceback:\n")
+    print(traceback())
+  })
+}
+
+# ========== GENERATE SUMMARY REPORT ==========
+cat("\n=== GENERATING SUMMARY REPORT ===\n")
+
+tryCatch({
+  generate_summary_report(results, r_out)
+  cat("Summary report generated\n")
+}, error = function(e) {
+  cat("Error generating report:", e$message, "\n")
+})
+
+# ========== SAVE PRESENCE/ABSENCE DATA ==========
+cat("\n=== SAVING PRESENCE DATA ===\n")
+
+tryCatch({
+  if (nrow(results) > 0) {
+    # Create presence/absence matrix
+    gene_presence <- results %>%
+      distinct(Species, Gene_Acronym, .keep_all = TRUE) %>%
+      mutate(Presence = 1) %>%
+      select(Species, Gene_Acronym, Presence) %>%
+      complete(Species = all_species, Gene_Acronym = unique(results$Gene_Acronym),
+               fill = list(Presence = 0)) %>%
+      pivot_wider(names_from = Gene_Acronym, values_from = Presence, values_fill = 0) %>%
+      arrange(Species)
+    
+    # Save
+    output_file <- file.path(r_out, "gene_presence_matrix.csv")
+    fwrite(gene_presence, output_file)
+    cat("Presence matrix saved:", output_file, "\n")
+    
+    # Also save complete data
+    complete_presence <- results %>%
+      distinct(Species, Gene_Acronym, .keep_all = TRUE) %>%
+      select(Species, Type, Target, Gene_Acronym, Gene_Name, Antifungal_Mechanism) %>%
+      arrange(Species, Gene_Acronym)
+    
+    output_file2 <- file.path(r_out, "complete_gene_presence_by_species.csv")
+    fwrite(complete_presence, output_file2)
+    cat("Complete presence data saved:", output_file2, "\n")
+  } else {
+    cat("No data to generate presence matrix\n")
+  }
+}, error = function(e) {
+  cat("Error saving presence data:", e$message, "\n")
+})
+
+# ========== FINAL VERIFICATION ==========
+cat("\n========================================\n")
+cat("FINAL INTEGRITY VERIFICATION\n")
+cat("========================================\n")
+
+cat("Total species in metadata:", length(all_species), "\n")
+cat("Species with hits:", ifelse(nrow(results) > 0, n_distinct(results$Species), 0), "\n")
+
+if (nrow(results) > 0) {
+  stats_by_species <- results %>%
+    group_by(Species) %>%
+    summarise(
+      Hits = n(),
+      Unique_Genes = n_distinct(Gene_Acronym[!is.na(Gene_Acronym) & Gene_Acronym != "Unknown"]),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(Hits))
+  
+  cat("\nTop 10 species with most hits:\n")
+  print(head(stats_by_species, 10))
+  
+  # Save statistics
+  fwrite(stats_by_species, file.path(r_out, "final_statistics_by_species.csv"))
+  
+  # Summary by mechanism
+  stats_by_mechanism <- results %>%
+    group_by(Antifungal_Mechanism) %>%
+    summarise(
+      Hits = n(),
+      Unique_Genes = n_distinct(Gene_Acronym),
+      Unique_Species = n_distinct(Species),
+      .groups = "drop"
+    ) %>%
+    arrange(desc(Hits))
+  
+  cat("\nSummary by antifungal mechanism:\n")
+  print(stats_by_mechanism)
+  
+  fwrite(stats_by_mechanism, file.path(r_out, "final_statistics_by_mechanism.csv"))
+}
+
+cat("\n=== ANALYSIS SUCCESSFULLY COMPLETED ===\n")
+cat("Results directory:", r_out, "\n")
+cat("Files generated:\n")
+
+output_files <- list.files(r_out, pattern = "\\.(csv|png|pdf|rds)$", full.names = FALSE)
+if (length(output_files) > 0) {
+  for (file in sort(output_files)) {
+    file_path <- file.path(r_out, file)
+    size <- file.size(file_path)
+    cat(sprintf("  %-45s %8s\n", file, 
+                format(size, big.mark = ",", scientific = FALSE)))
+  }
+} else {
+  cat("  (No files generated)\n")
+}
+
+cat("\nFinal summary:\n")
+cat("- Total hits processed:", nrow(results), "\n")
+cat("- Species with hits:", ifelse(nrow(results) > 0, n_distinct(results$Species), 0), "\n")
+cat("- Unique genes identified:", ifelse(nrow(results) > 0, n_distinct(results$Gene_Acronym), 0), "\n")
+cat("- Mechanisms identified:", ifelse(nrow(results) > 0, n_distinct(results$Antifungal_Mechanism), 0), "\n")
+
+cat("\nEnd date:", format(Sys.time(), "%Y-%m-%d %H:%M:%S"), "\n")
+cat("========================================\n")
+
+
+
+###################################################################################################################################
+############################################### Preview of species and genes ######################################################
+
+# visualisation_functions_ANTIFUNGAL_FINAL.R
+
+library(tidyverse)
+library(pheatmap)
+library(viridis)
+library(ggplot2)
+library(data.table)
+library(RColorBrewer)
+library(gridExtra)
+
+# ========== MAIN ANALYSIS FUNCTION ==========
+generate_category_analysis <- function(data, output_dir, category_name, 
+                                       additional_meta = NULL, all_species = NULL) {
+  
+  cat("Generating analysis for:", category_name, "\n")
+  
+  # Initial validation
+  if (is.null(data) || nrow(data) == 0) {
+    cat(" No data for this category\n")
+    
+    # Create basic structure if species are defined
+    if (!is.null(all_species) && length(all_species) > 0) {
+      presence_data <- data.frame(
+        Species = all_species,
+        No_hits = 0,
+        stringsAsFactors = FALSE
+      )
+      
+      output_file <- file.path(output_dir, paste0("presence_absence_", category_name, ".csv"))
+      fwrite(presence_data, output_file)
+      cat(" Empty file created:", basename(output_file), "\n")
+    }
+    
+    return(invisible(NULL))
+  }
+  
+  # Verify essential columns
+  required_cols <- c("Species", "Gene_Acronym")
+  missing_cols <- setdiff(required_cols, names(data))
+  
+  if (length(missing_cols) > 0) {
+    cat("Missing columns:", paste(missing_cols, collapse = ", "), "\n")
+    return(invisible(NULL))
+  }
+  
+  # 1. CREATE PRESENCE/ABSENCE MATRIX - CORRECTED
+  cat("  Creating presence/absence matrix...\n")
+  
+  create_presence_matrix <- function(data, all_species) {
+    # Filter valid data
+    clean_data <- data %>%
+      filter(
+        !is.na(Species),
+        !is.na(Gene_Acronym),
+        Gene_Acronym != "",
+        Gene_Acronym != "No_hits",
+        Gene_Acronym != "Unknown"
+      )
+    
+    if (nrow(clean_data) == 0) {
+      cat("No valid genes after filtering\n")
+      return(NULL)
+    }
+    
+    # Get unique genes
+    all_genes <- unique(clean_data$Gene_Acronym)
+    all_genes <- all_genes[!is.na(all_genes) & all_genes != ""]
+    
+    if (length(all_genes) == 0) {
+      cat("No valid unique genes\n")
+      return(NULL)
+    }
+    
+    cat("    Unique genes:", length(all_genes), "\n")
+    cat("    Unique species:", length(unique(clean_data$Species)), "\n")
+    
+    # Create complete matrix
+    presence_data <- expand.grid(
+      Species = all_species,
+      Gene_Acronym = all_genes,
+      stringsAsFactors = FALSE
+    ) %>%
+      left_join(
+        clean_data %>%
+          distinct(Species, Gene_Acronym) %>%
+          mutate(present = 1),
+        by = c("Species", "Gene_Acronym")
+      ) %>%
+      mutate(present = ifelse(is.na(present), 0, present)) %>%
+      pivot_wider(
+        id_cols = Species,
+        names_from = Gene_Acronym,
+        values_from = present,
+        values_fill = 0
+      )
+    
+    return(presence_data)
+  }
+  
+  presence_data <- create_presence_matrix(data, all_species)
+  
+  # Save matrix if exists
+  if (!is.null(presence_data) && ncol(presence_data) > 1) {
+    output_file <- file.path(output_dir, paste0("presence_absence_", category_name, ".csv"))
+    fwrite(presence_data, output_file)
+    cat("Matrix saved:", basename(output_file), 
+        sprintf("(%d species × %d genes)\n", 
+                nrow(presence_data), ncol(presence_data) - 1))
+  } else {
+    cat("Could not create presence matrix\n")
+  }
+  
+  # 2. GENERATE HEATMAP (if enough data)
+  cat("  Generating heatmap...\n")
+  
+  create_heatmap <- function(presence_data, output_path, plot_title) {
+    if (is.null(presence_data) || ncol(presence_data) <= 2) {
+      cat("X Insufficient data for heatmap\n")
+      return(invisible(NULL))
+    }
+    
+    tryCatch({
+      # Prepare data
+      heatmap_data <- presence_data %>%
+        remove_rownames() %>%
+        column_to_rownames("Species")
+      
+      # Filter genes that don't appear in any species
+      heatmap_data <- heatmap_data[, colSums(heatmap_data) > 0, drop = FALSE]
+      
+      if (ncol(heatmap_data) == 0) {
+        cat("    X No genes with presence after filtering\n")
+        return(invisible(NULL))
+      }
+      
+      # Filter if too many genes
+      max_genes <- 100
+      if (ncol(heatmap_data) > max_genes) {
+        gene_freq <- colSums(heatmap_data)
+        top_genes <- names(sort(gene_freq, decreasing = TRUE))[1:max_genes]
+        heatmap_data <- heatmap_data[, top_genes, drop = FALSE]
+        cat(sprintf("    Limited to %d most frequent genes\n", max_genes))
+      }
+      
+      # Shorten long names
+      colnames(heatmap_data) <- sapply(colnames(heatmap_data), function(x) {
+        if (nchar(x) > 25) paste0(substr(x, 1, 23), "..") else x
+      })
+      
+      # Calculate dimensions
+      n_species <- nrow(heatmap_data)
+      n_genes <- ncol(heatmap_data)
+      
+      plot_height <- max(6, n_species * 0.2 + 2)
+      plot_width <- max(8, min(n_genes * 0.25, 25))
+      
+      # Configure clustering
+      cluster_rows <- n_species > 2
+      cluster_cols <- n_genes > 2
+      
+      # Color palette
+      color_palette <- colorRampPalette(c("white", "darkblue"))(2)
+      
+      # Generate heatmap
+      pheatmap(
+        mat = as.matrix(heatmap_data),
+        main = plot_title,
+        color = color_palette,
+        breaks = c(0, 0.5, 1),
+        cluster_rows = cluster_rows,
+        cluster_cols = cluster_cols,
+        show_colnames = TRUE,
+        show_rownames = TRUE,
+        fontsize_row = max(6, min(10, 200/n_species)),
+        fontsize_col = max(6, min(9, 200/n_genes)),
+        cellwidth = ifelse(n_genes < 30, 15, NA),
+        cellheight = ifelse(n_species < 30, 12, NA),
+        border_color = "grey60",
+        filename = output_path,
+        width = plot_width,
+        height = plot_height,
+        silent = FALSE
+      )
+      
+      cat("   Heatmap generated:", basename(output_path), 
+          sprintf("(%d x %d)\n", n_species, n_genes))
+      
+    }, error = function(e) {
+      cat("    X Error in heatmap:", e$message, "\n")
+    })
+  }
+  
+  if (!is.null(presence_data) && ncol(presence_data) > 2) {
+    heatmap_path <- file.path(output_dir, paste0("heatmap_", category_name, ".png"))
+    create_heatmap(presence_data, heatmap_path, category_name)
+  }
+  
+  # 3. COVERAGE DISTRIBUTION PLOT - CORRECTED
+  if (nrow(data) > 0 && all(c("QCov", "TCov") %in% names(data))) {
+    cat("  Generating coverage plot...\n")
+    
+    tryCatch({
+      plot_data <- data %>%
+        mutate(
+          QCov = as.numeric(gsub(",", ".", as.character(QCov))),
+          TCov = as.numeric(gsub(",", ".", as.character(TCov)))
+        ) %>%
+        filter(!is.na(QCov) & !is.na(TCov) & QCov > 0 & TCov > 0)
+      
+      if (nrow(plot_data) > 0) {
+        # Create multiple plots
+        p1 <- ggplot(plot_data, aes(x = QCov, y = TCov)) +
+          geom_hex(bins = 30, alpha = 0.8) +
+          geom_abline(slope = 1, intercept = 0, 
+                      linetype = "dashed", color = "red", size = 0.8) +
+          scale_fill_viridis_c(trans = "log10", name = "Count") +
+          labs(
+            title = paste("Coverage Distribution -", category_name),
+            subtitle = paste(format(nrow(plot_data), big.mark = ","), "hits"),
+            x = "Query Coverage (%)",
+            y = "Target Coverage (%)"
+          ) +
+          theme_minimal(base_size = 12) +
+          theme(
+            plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+            plot.subtitle = element_text(hjust = 0.5, color = "gray40", size = 10),
+            panel.grid.minor = element_blank(),
+            legend.position = "right"
+          )
+        
+        p2 <- ggplot(plot_data, aes(x = QCov)) +
+          geom_histogram(bins = 30, fill = "steelblue", alpha = 0.7) +
+          labs(x = "Query Coverage (%)", y = "Frequency") +
+          theme_minimal()
+        
+        p3 <- ggplot(plot_data, aes(x = TCov)) +
+          geom_histogram(bins = 30, fill = "darkgreen", alpha = 0.7) +
+          labs(x = "Target Coverage (%)", y = "Frequency") +
+          theme_minimal()
+        
+        # Combine plots
+        combined_plot <- grid.arrange(p1, arrangeGrob(p2, p3, ncol = 2), 
+                                      nrow = 2, heights = c(2, 1))
+        
+        ggsave(
+          file.path(output_dir, paste0("coverage_", category_name, ".png")),
+          combined_plot,
+          width = 12,
+          height = 10,
+          dpi = 300
+        )
+        cat("Coverage plot generated\n")
+      }
+    }, error = function(e) {
+      cat("Error in coverage plot:", e$message, "\n")
+    })
+  }
+  
+  # 4. TOP GENES PLOT - CORRECTED
+  if (nrow(data) > 0 && "Gene_Acronym" %in% names(data)) {
+    cat("  Generating top genes plot...\n")
+    
+    tryCatch({
+      top_genes <- data %>%
+        filter(!is.na(Gene_Acronym) & 
+                 Gene_Acronym != "" & 
+                 Gene_Acronym != "No_hits" & 
+                 Gene_Acronym != "Unknown") %>%
+        distinct(Species, Gene_Acronym) %>%
+        count(Gene_Acronym, name = "Frequency") %>%
+        arrange(desc(Frequency))
+      
+      if (nrow(top_genes) > 0) {
+        # Limit to top 25
+        top_genes <- top_genes %>% slice_head(n = 25)
+        
+        # Create plot
+        freq_plot <- ggplot(top_genes, aes(x = reorder(Gene_Acronym, Frequency), 
+                                           y = Frequency)) +
+          geom_col(fill = "steelblue", alpha = 0.8, width = 0.7) +
+          geom_text(aes(label = Frequency), 
+                    hjust = -0.3, size = 3.5, color = "black", fontface = "bold") +
+          scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+          coord_flip() +
+          labs(
+            title = paste("Most Frequent Genes -", category_name),
+            subtitle = paste("Total species:", length(unique(data$Species))),
+            x = "Gene",
+            y = "Number of Species"
+          ) +
+          theme_minimal(base_size = 12) +
+          theme(
+            plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+            plot.subtitle = element_text(hjust = 0.5, color = "gray40", size = 11),
+            axis.text.y = element_text(size = 10, face = "bold"),
+            axis.title.y = element_text(margin = margin(r = 10)),
+            panel.grid.major.y = element_blank(),
+            panel.grid.minor.x = element_blank(),
+            panel.background = element_rect(fill = "white", color = NA),
+            plot.background = element_rect(fill = "white", color = NA)
+          )
+        
+        ggsave(
+          file.path(output_dir, paste0("top_genes_", category_name, ".png")),
+          freq_plot,
+          width = 14,
+          height = 10,
+          dpi = 300
+        )
+        cat(sprintf("Top genes plot generated (%d genes shown)\n", nrow(top_genes)))
+      }
+    }, error = function(e) {
+      cat("Error in top genes plot:", e$message, "\n")
+    })
+  }
+  
+  # 5. ANTIFUNGAL MECHANISM PLOT
+  if (nrow(data) > 0 && "Antifungal_Mechanism" %in% names(data)) {
+    cat("  Generating mechanism plot...\n")
+    
+    tryCatch({
+      mechanism_data <- data %>%
+        filter(!is.na(Antifungal_Mechanism) & 
+                 Antifungal_Mechanism != "" & 
+                 Antifungal_Mechanism != "Unknown mechanism") %>%
+        distinct(Species, Antifungal_Mechanism, Gene_Acronym) %>%
+        group_by(Antifungal_Mechanism) %>%
+        summarise(
+          Unique_Genes = n_distinct(Gene_Acronym),
+          Unique_Species = n_distinct(Species),
+          .groups = "drop"
+        ) %>%
+        arrange(desc(Unique_Species))
+      
+      if (nrow(mechanism_data) > 0) {
+        mechanism_plot <- ggplot(mechanism_data, 
+                                 aes(x = reorder(Antifungal_Mechanism, Unique_Species), 
+                                     y = Unique_Species)) +
+          geom_col(fill = "darkgreen", alpha = 0.7, width = 0.6) +
+          geom_text(aes(label = paste(Unique_Species, "species")), 
+                    hjust = -0.1, size = 3.5, color = "black") +
+          scale_y_continuous(expand = expansion(mult = c(0, 0.2))) +
+          coord_flip() +
+          labs(
+            title = paste("Distribution by Mechanism -", category_name),
+            x = "Antifungal Mechanism",
+            y = "Number of Species"
+          ) +
+          theme_minimal(base_size = 12) +
+          theme(
+            plot.title = element_text(hjust = 0.5, face = "bold", size = 14),
+            axis.text.y = element_text(size = 10),
+            panel.grid.major.y = element_blank()
+          )
+        
+        ggsave(
+          file.path(output_dir, paste0("mechanism_distribution_", category_name, ".png")),
+          mechanism_plot,
+          width = 12,
+          height = 8,
+          dpi = 300
+        )
+        cat("Mechanism plot generated\n")
+      }
+    }, error = function(e) {
+      cat("Error in mechanism plot:", e$message, "\n")
+    })
+  }
+  
+  # 6. SAVE IMPROVED GENE METADATA
+  if (nrow(data) > 0 && all(c("Target", "Gene_Acronym") %in% names(data))) {
+    cat("  Saving gene metadata...\n")
+    
+    tryCatch({
+      gene_metadata <- data %>%
+        select(Target, Gene_Acronym, Gene_Name, Antifungal_Mechanism) %>%
+        filter(!is.na(Gene_Acronym) & Gene_Acronym != "No_hits" & Gene_Acronym != "") %>%
+        distinct()
+      
+      # Add additional metadata if available
+      if (!is.null(additional_meta) && nrow(gene_metadata) > 0) {
+        gene_metadata <- gene_metadata %>%
+          left_join(
+            additional_meta %>%
+              select(Gene_Acronym, Gene_Name, Antifungal_Mechanism) %>%
+              distinct(),
+            by = "Gene_Acronym",
+            suffix = c("", "_meta")
+          ) %>%
+          mutate(
+            Gene_Name = ifelse(is.na(Gene_Name) | Gene_Name == "", Gene_Name_meta, Gene_Name),
+            Antifungal_Mechanism = ifelse(is.na(Antifungal_Mechanism) | Antifungal_Mechanism == "", 
+                                          Antifungal_Mechanism_meta, Antifungal_Mechanism)
+          ) %>%
+          select(-ends_with("_meta"))
+      }
+      
+      if (nrow(gene_metadata) > 0) {
+        output_file <- file.path(output_dir, paste0("gene_metadata_", category_name, ".csv"))
+        fwrite(gene_metadata, output_file)
+        cat(sprintf("Gene metadata saved (%d records)\n", nrow(gene_metadata)))
+      }
+    }, error = function(e) {
+      cat("Error saving metadata:", e$message, "\n")
+    })
+  }
+  
+  cat("Analysis completed for:", category_name, "\n")
+  invisible(TRUE)
+}
+
+# ========== SUMMARY REPORT FUNCTION ==========
+generate_summary_report <- function(data, output_dir) {
+  cat("Generating summary report...\n")
+  
+  # Validation
+  if (is.null(data) || nrow(data) == 0) {
+    cat("No data for report\n")
+    
+    # Create empty structure
+    summary_data <- data.frame(
+      Species = character(),
+      Type = character(),
+      Unique_Genes = integer(),
+      Total_Hits = integer(),
+      stringsAsFactors = FALSE
+    )
+    
+    fwrite(summary_data, file.path(output_dir, "analysis_summary.csv"))
+    
+    # Create empty plot
+    empty_plot <- ggplot() +
+      annotate("text", x = 0.5, y = 0.5, 
+               label = "No data available", size = 8, color = "gray50") +
+      theme_void()
+    
+    ggsave(
+      file.path(output_dir, "summary_by_category.png"),
+      empty_plot,
+      width = 10,
+      height = 8,
+      dpi = 300
+    )
+    
+    return(invisible(NULL))
+  }
+  
+  # Verify required columns
+  required_cols <- c("Species", "Type", "Gene_Acronym")
+  missing_cols <- setdiff(required_cols, names(data))
+  
+  if (length(missing_cols) > 0) {
+    cat("Missing columns for report:", paste(missing_cols, collapse = ", "), "\n")
+    return(invisible(NULL))
+  }
+  
+  tryCatch({
+    # Calculate summary statistics
+    summary_data <- data %>%
+      filter(!is.na(Species) & !is.na(Type)) %>%
+      group_by(Species, Type) %>%
+      summarise(
+        Unique_Genes = n_distinct(Gene_Acronym[!is.na(Gene_Acronym) & 
+                                                 Gene_Acronym != "No_hits" & 
+                                                 Gene_Acronym != ""]),
+        Total_Hits = n(),
+        .groups = "drop"
+      ) %>%
+      arrange(desc(Total_Hits))
+    
+    # Save data
+    fwrite(summary_data, file.path(output_dir, "analysis_summary.csv"))
+    cat(sprintf("Summary data saved (%d rows)\n", nrow(summary_data)))
+    
+    # Generate plot if there is data
+    if (nrow(summary_data) > 0) {
+      # Limit to top 30 species for better visualization
+      if (nrow(summary_data) > 30) {
+        plot_data <- summary_data %>%
+          filter(Species %in% head(unique(summary_data$Species), 30))
+        cat("  Note: Showing only top 30 species\n")
+      } else {
+        plot_data <- summary_data
+      }
+      
+      n_species <- n_distinct(plot_data$Species)
+      plot_height <- max(8, n_species * 0.3 + 2)
+      
+      # Ensure Type is factor
+      plot_data$Type <- factor(plot_data$Type)
+      
+      # Color palette
+      n_types <- nlevels(plot_data$Type)
+      type_colors <- if (n_types <= 8) {
+        brewer.pal(max(3, n_types), "Set2")[1:n_types]
+      } else {
+        colorRampPalette(brewer.pal(8, "Set2"))(n_types)
+      }
+      
+      # Create plot
+      summary_plot <- ggplot(plot_data, 
+                             aes(x = reorder(Species, Total_Hits), 
+                                 y = Total_Hits, 
+                                 fill = Type)) +
+        geom_col(position = position_dodge(preserve = "single"), 
+                 width = 0.7, alpha = 0.9) +
+        scale_fill_manual(values = type_colors, name = "Category") +
+        labs(
+          title = "Summary of Findings by Species",
+          subtitle = paste("Total species with hits:", n_distinct(summary_data$Species)),
+          x = "Species",
+          y = "Total Hits"
+        ) +
+        theme_minimal(base_size = 12) +
+        theme(
+          plot.title = element_text(hjust = 0.5, size = 16, face = "bold"),
+          plot.subtitle = element_text(hjust = 0.5, size = 11, color = "gray50"),
+          axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+          axis.title.x = element_text(margin = margin(t = 10)),
+          legend.position = "bottom",
+          legend.box = "horizontal",
+          panel.grid.major.x = element_blank(),
+          panel.grid.minor.y = element_blank()
+        ) +
+        coord_flip()
+      
+      # Save plot
+      ggsave(
+        file.path(output_dir, "summary_by_category.png"),
+        summary_plot,
+        width = 14,
+        height = plot_height,
+        dpi = 300
+      )
+      
+      # Additional plot: hits by species (without type)
+      species_summary <- summary_data %>%
+        group_by(Species) %>%
+        summarise(Total_Hits = sum(Total_Hits), .groups = "drop") %>%
+        arrange(desc(Total_Hits)) %>%
+        slice_head(n = 20)
+      
+      species_plot <- ggplot(species_summary, 
+                             aes(x = reorder(Species, Total_Hits), y = Total_Hits)) +
+        geom_col(fill = "steelblue", alpha = 0.8) +
+        geom_text(aes(label = Total_Hits), hjust = -0.3, size = 3.5) +
+        coord_flip() +
+        labs(
+          title = "Top 20 Species with Most Hits",
+          x = "Species",
+          y = "Total Hits"
+        ) +
+        theme_minimal() +
+        theme(plot.title = element_text(hjust = 0.5, face = "bold"))
+      
+      ggsave(
+        file.path(output_dir, "top_species_summary.png"),
+        species_plot,
+        width = 12,
+        height = 8,
+        dpi = 300
+      )
+      
+      cat("Summary plots generated\n")
+    }
+    
+  }, error = function(e) {
+    cat("Error in summary report:", e$message, "\n")
+    print(traceback())
+  })
+  
+  invisible(TRUE)
+}
+
+
+
+
