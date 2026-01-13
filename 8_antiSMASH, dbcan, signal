@@ -1,0 +1,209 @@
+################ HJ ####################
+# antiSMASH - Secondary metabolites
+
+# Install
+conda create -n antismash_env \
+  -c conda-forge -c bioconda \
+  antismash hmmer diamond blast prodigal glimmerhmm
+
+
+# Script for running large databases
+
+#!/bin/bash
+
+# ==============================================================================
+# SETUP
+# ==============================================================================
+INPUT_DIR="/media/dorne/hector/bacillus_spp/10_anti_mash/genomas_gbk/genomas_total/"
+OUTPUT_DIR="/media/dorne/hector/bacillus_spp/10_anti_mash/genomas_gbk/results_anti_mash"
+LOG_DIR="${OUTPUT_DIR}/logs"
+THREADS=40
+CPUS_PER_GENOME=2   # Núcleos por genoma
+
+# ==============================================================================
+# PREPARATION OF DIRECTORIES
+# ==============================================================================
+mkdir -p "${OUTPUT_DIR}" "${LOG_DIR}"
+
+# ==============================================================================
+# PROCESSING FUNCTION
+# ==============================================================================
+process_genome() {
+    local gbk_file="$1"
+    local base_id=$(basename "${gbk_file}" .gbk)
+    local timestamp=$(date +"%Y%m%d_%H%M%S")
+    local log_file="${LOG_DIR}/${base_id}_${timestamp}.log"
+
+    echo "PROCESSING STARTED: ${base_id}" | tee -a "${log_file}"
+    echo "INPUT: ${gbk_file}" | tee -a "${log_file}"
+    
+    local output_subdir="${OUTPUT_DIR}/${base_id}"
+
+    {
+        echo "===== ANTISMASH COMMAND ====="
+        echo "antismash \\
+            --output-dir \"${output_subdir}\" \\
+            --genefinding-tool prodigal \\
+            --taxon bacteria \\
+            --cpus ${CPUS_PER_GENOME} \\
+            --asf \\
+            --enable-html \\
+            --cc-mibig \\
+            --cb-general \\
+            --cb-subclusters \\
+            --cb-knownclusters \\
+            --smcog-trees \\
+            --rre \\
+            --pfam2go \\
+            \"${gbk_file}\""
+        
+        timeout 48h antismash \
+            --output-dir "${output_subdir}" \
+            --genefinding-tool prodigal \
+            --taxon bacteria \
+            --cpus ${CPUS_PER_GENOME} \
+            --asf \
+            --enable-html \
+            --cc-mibig \
+            --cb-general \
+            --cb-subclusters \
+            --cb-knownclusters \
+            --smcog-trees \
+            --rre \
+            --pfam2go \
+            "${gbk_file}"
+
+        exit_code=$?
+        echo "===== EXIT STATUS: ${exit_code} ====="
+        [[ ${exit_code} -eq 0 ]] && echo "STATUS: SUCCESS" || echo "STATUS: FAILED"
+    } &> "${log_file}"
+
+    if [[ ${exit_code} -eq 0 ]]; then
+        tar -czf "${output_subdir}.tar.gz" -C "$(dirname "${output_subdir}")" "$(basename "${output_subdir}")"
+        rm -rf "${output_subdir}"
+        echo "COMPRESSED: ${output_subdir}.tar.gz" | tee -a "${log_file}"
+    fi
+
+    echo "PROCESSING COMPLETED: ${base_id}" | tee -a "${log_file}"
+    return ${exit_code}
+}
+
+export -f process_genome
+export OUTPUT_DIR LOG_DIR CPUS_PER_GENOME
+
+# ==============================================================================
+# MAIN EXECUTION
+# ==============================================================================
+source "$(conda info --base)/etc/profile.d/conda.sh"
+conda activate antismash_env
+
+echo "===== ANTISMASH BATCH PROCESSING STARTED ====="
+echo "START TIME: $(date)"
+echo "TOTAL THREADS (genomas en paralelo): ${THREADS}"
+echo "CPUs por genoma: ${CPUS_PER_GENOME}"
+
+find "${INPUT_DIR}" -maxdepth 1 -type f -name "*.gbk" | \
+xargs -I {} -P ${THREADS} bash -c 'process_genome "$@"' _ {}
+
+echo "===== PROCESSING COMPLETED ====="
+echo "END TIME: $(date)"
+echo "SUMMARY:"
+
+success_count=$(grep -l "STATUS: SUCCESS" "${LOG_DIR}"/*.log 2>/dev/null | wc -l)
+failed_count=$(grep -l "STATUS: FAILED" "${LOG_DIR}"/*.log 2>/dev/null | wc -l)
+total_count=$(find "${INPUT_DIR}" -maxdepth 1 -type f -name "*.gbk" | wc -l)
+
+echo " - Total genomes processed: ${total_count}"
+echo " - Successful: ${success_count}"
+echo " - Failed: ${failed_count}"
+
+####################################################################
+####################################################################
+################# dbcan ############################################
+# Install
+conda create -n dbcan_env -c conda-forge -c bioconda dbcan
+conda activate dbcan_env
+
+# Usage script for large data sets
+cd /mxxxx/xxxx/hxxxxx/bacillus_spp/6_1_prokka_represent/genomes_represent_faa
+
+mkdir -p dbcan_results
+
+for faa in *.faa; do
+    base=$(basename "$faa" .faa)
+    echo ">>> Analizando $base"
+
+    run_dbcan \
+      "$faa" protein \
+      --db_dir /xxxx/xxxxx/xxxxxx/base_datos/db \
+      --out_dir dbcan_results/"$base" \
+      --tools all \
+      --dia_cpu 26 \
+      --hmm_cpu 26 \
+      --dbcan_thread 26 \
+      --gram p
+done
+
+
+
+####################################################################
+####################################################################
+################# Signal 6 #########################################
+
+# Install
+conda create -n signalp6 python=3.10
+conda activate signalp6
+
+# Usage script for large data sets
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
+
+cd /XXXX/XXXXX/XXXX/bacillus_spp/6_1_prokka_represent/genomes_represent_faa || exit 1
+
+OUTBASE="signalp6_results"
+mkdir -p “$OUTBASE”
+
+MODEL_DIR=“/XXXXX/XXXXX/XXXXX/XXXX/signalp-6.0i.slow_sequential/signalp6_slow_sequential/signalp-6-package/models/sequential_models_signalp6”
+
+JOBS=60   # adjusted for 104 threads
+
+export OUTBASE MODEL_DIR
+
+run_signalp () {
+    faa="$1"
+    base=$(basename “$faa” .faa)
+    outdir="${OUTBASE}/${base}"
+    mkdir -p “$outdir”
+
+    echo “[$base] SignalP6 running...”
+
+    python -m signalp.predict \
+      --fastafile “$faa” \
+      --organism other \
+      --mode slow-sequential \
+      --model_dir “$MODEL_DIR” \
+      --format txt \
+      --output_dir “$outdir”
+}
+
+export -f run_signalp
+
+parallel -j “$JOBS” run_signalp ::: *.faa
+
+echo “SignalP6 completed successfully”
+
+
+
+
+
+
+
+
+
+
