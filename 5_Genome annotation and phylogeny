@@ -1,0 +1,113 @@
+########## HJ ########################################
+## Use of pyANI
+###Run nummer
+ conda activate pyani_env
+ 
+ # Using blast
+average_nucleotide_identity.py -i . -o ../pyani_output -m ANIb --workers 40
+
+# Using nummer
+average_nucleotide_identity.py -i . -o ../pyani_anim_output -m ANIm --workers 40
+
+# Default graphics
+average_nucleotide_identity.py -i . -o ../pyani_anim_output -m ANIm --workers 40 --graphics
+
+######################################################
+######################################################
+### Genome annotation ###
+# PROKKA
+
+#!/bin/bash
+
+set -euo pipefail
+
+# Parameters
+OUTDIR="../prokka_out"
+GENUS="Bacillus"
+KINGDOM="Bacteria"
+CPUS=70
+
+mkdir -p “$OUTDIR”
+
+# Avoid errors if there are no .fna files
+shopt -s nullglob
+
+for genome in *.fna; do
+    base="${genome%.fna}"
+
+    echo “Annotating $base with Prokka...”
+
+    prokka “$genome” \
+        --outdir “$OUTDIR/$base” \
+        --prefix “$base” \
+        --genus “$GENUS” \
+        --kingdom “$KINGDOM” \
+        --cpus “$CPUS”
+done
+
+echo “Annotation complete. Results in: $OUTDIR”
+
+
+##################################################
+######## Use of Orthofinderv #####################
+#Install
+conda create -n orthofinder_env orthofinder -c bioconda -c conda-forge
+conda activate orthofinder_env
+
+# Representative genomes for phylogeny
+orthofinder -f genomas_represent/ -S diamond -M msa -t 70  
+
+################################################
+########### Use of MAFFT ######################
+# Install
+conda create -n mafft_env mafft -c bioconda -c conda-forge
+conda activate mafft_env
+
+# Use of single copies:
+Single_Copy_Orthologue_Sequences/
+
+# Create an alignment bash in MAFFT
+#!/bin/bash
+
+# Create directory for alignments
+
+mkdir mafft_alignments
+
+# Align each orthogroup with 30 threads
+for file in Species_Named_Orthogroups/*.fa; do
+    base_name=$(basename “$file” .fa)
+    mafft --auto --thread 30 --quiet “$file” > “mafft_alignments/${base_name}.aln”
+done
+
+##############################################
+######### BGME ##############################
+# Install
+conda install -c bioconda bmge
+
+# Concatenate with the created Python script and then filter.
+# Use BMGE to filter the files. 
+# If it doesn't appear, first find where it is, to indicate.
+find $CONDA_PREFIX -name “BMGE.jar”
+# Indicate where it is; then use the script below.
+ln -s /xxxxx/xxxx/miniconda3/envs/seaborn_env/share/bmge-1.12-1/BMGE.jar
+ln -s /xxxxx/xxxx/miniconda3/envs/seaborn_env/share/bmge-1.12-1/BMGE.jar
+
+# After doing the above, use the concatenation
+java -jar BMGE.jar -i super_matrix_concatenado.fas -t AA -of supermatriz_filtrada.fas
+
+###########################################
+######## IQTREE ###########################
+iqtree -s supermatriz_filtrada.fas \
+       -st AA \
+       -bb 1000 \
+       -bnni \
+       -T 80 \
+       -seed 1998 \
+       -m TEST \
+       -o Metabacillus_fastidiosus,Metabacillus_litoralis,Metabacillus_niabensis \
+       -pre bacillus_phylogeny
+
+########################################
+# Load the .tree file into Itol
+# Pag.:
+        https://itol.embl.de/
